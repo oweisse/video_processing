@@ -3,11 +3,18 @@ Video Audio Processing & Denoising Script
 
 This script extracts the audio track from a video file, filters out background noise using DeepFilterNet, and optionally merges the clean audio back into the video.
 
-Requirements
-------------
+Installation & Setup
+--------------------
+You can automatically install all required dependencies (FFmpeg, pipx, DeepFilterNet, and soundfile) by running the setup script in your terminal:
+
+  chmod +x setup.sh
+  ./setup.sh
+
+Requirements (installed automatically by setup.sh)
+--------------------------------------------------
 1. Python 3
-2. FFmpeg (installed and available in system PATH)
-3. DeepFilterNet (command line tool 'deepFilter' available)
+2. FFmpeg
+3. DeepFilterNet (configured inside a pipx virtual environment)
 
 Usage
 -----
