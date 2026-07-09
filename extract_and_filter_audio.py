@@ -3,9 +3,53 @@ import argparse
 import os
 import shutil
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
+
+# Try to import DeepFilterNet packages.
+HAS_DF_API = False
+try:
+    import torch
+    import torch.nn.functional as F
+    from df.enhance import init_df, enhance, get_device
+    from df.io import load_audio, save_audio
+    from df.model import ModelParams
+    HAS_DF_API = True
+except ImportError:
+    pass
+
+# Re-execute in the deepfilternet venv python if we're not already running it and it's available
+if not HAS_DF_API:
+    deepfilter_path = shutil.which("deepFilter")
+    if deepfilter_path:
+        venv_python = None
+        # Try reading shebang first (useful for pipx wrappers which are text files)
+        try:
+            with open(deepfilter_path, "r", encoding="utf-8") as f:
+                first_line = f.readline().strip()
+                if first_line.startswith("#!"):
+                    interpreter = first_line[2:].split()[0]
+                    if os.path.exists(interpreter):
+                        venv_python = interpreter
+        except Exception:
+            pass
+            
+        if not venv_python:
+            # Fallback to resolving symlinks
+            real_path = os.path.realpath(deepfilter_path)
+            venv_dir = os.path.dirname(real_path)
+            venv_python = os.path.join(venv_dir, "python")
+            if not os.path.exists(venv_python):
+                venv_python = None
+                
+        if venv_python and sys.executable != venv_python:
+            try:
+                os.execv(venv_python, [venv_python] + sys.argv)
+            except Exception:
+                pass
 
 # ANSI escape codes for styling (only used if stdout is a TTY)
 COLOR_BLUE = "\033[94m"
@@ -48,6 +92,7 @@ def get_video_duration(video_path):
         video_path
     ]
     try:
+        print(f"Running command: {shlex.join(cmd)}")
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         return float(result.stdout.strip())
     except Exception:
@@ -56,7 +101,7 @@ def get_video_duration(video_path):
 def run_ffmpeg_with_progress(cmd_args, duration, prefix):
     # Append progress flags to make ffmpeg output periodic key-value updates
     cmd = cmd_args + ["-progress", "-", "-nostats"]
-    
+    print(f"Running command: {shlex.join(cmd)}")
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     
     speed = "N/A"
@@ -74,12 +119,16 @@ def run_ffmpeg_with_progress(cmd_args, duration, prefix):
                         filled_len = int(bar_len * pct / 100)
                         bar = "█" * filled_len + "-" * (bar_len - filled_len)
                         if sys.stdout.isatty():
-                            sys.stdout.write(f"\r{prefix}: [{bar}] {pct:.1f}% (Speed: {speed})")
+                            sys.stdout.write(f"\r{prefix}: [{bar}] {pct:.1f}% ({sec:.1f}s/{duration:.1f}s) (Speed: {speed})")
                             sys.stdout.flush()
                 except Exception:
                     pass
             elif line.startswith("speed="):
-                speed = line.split("=")[1].strip()
+                raw_speed = line.split("=")[1].strip()
+                if raw_speed.endswith("x"):
+                    speed = f"{raw_speed[:-1]} sec/sec"
+                else:
+                    speed = raw_speed
         
         process.wait()
         if process.returncode != 0:
@@ -89,7 +138,7 @@ def run_ffmpeg_with_progress(cmd_args, duration, prefix):
         # Draw final 100% state
         if duration:
             bar = "█" * bar_len
-            sys.stdout.write(f"\r{prefix}: [{bar}] 100.0% (Speed: {speed})\n")
+            sys.stdout.write(f"\r{prefix}: [{bar}] 100.0% ({duration:.1f}s/{duration:.1f}s) (Speed: {speed})\n")
         else:
             sys.stdout.write(f"\r{prefix}: Done!\n")
         sys.stdout.flush()
@@ -98,15 +147,90 @@ def run_ffmpeg_with_progress(cmd_args, duration, prefix):
         process.kill()
         raise e
 
+def enhance_chunked(model, df_state, audio, chunk_len_sec=10.0, overlap_sec=1.0, atten_lim_db=None):
+    with torch.no_grad():
+        sr = 48000
+        chunk_samples = int(chunk_len_sec * sr)
+        overlap_samples = int(overlap_sec * sr)
+        
+        total_samples = audio.shape[-1]
+        enhanced_audio = torch.zeros_like(audio)
+        
+        num_chunks = (total_samples + chunk_samples - 1) // chunk_samples
+        
+        bar_len = 30
+        start_time = time.time()
+        for i in range(num_chunks):
+            start = i * chunk_samples
+            end = min(total_samples, start + chunk_samples)
+            
+            pad_start = max(0, start - overlap_samples)
+            pad_end = min(total_samples, end + overlap_samples)
+            
+            chunk = audio[:, pad_start:pad_end]
+            
+            enhanced_chunk = enhance(model, df_state, chunk, pad=True, atten_lim_db=atten_lim_db)
+            
+            valid_start_in_chunk = start - pad_start
+            valid_end_in_chunk = valid_start_in_chunk + (end - start)
+            
+            enhanced_audio[:, start:end] = enhanced_chunk[:, valid_start_in_chunk:valid_end_in_chunk]
+            
+            # Calculate and print custom progress bar with speed
+            pct = ((i + 1) / num_chunks) * 100
+            filled_len = int(bar_len * (i + 1) // num_chunks)
+            bar = "█" * filled_len + "-" * (bar_len - filled_len)
+            total_sec = total_samples / sr
+            processed_sec = min(total_sec, (i + 1) * chunk_len_sec)
+            
+            elapsed = time.time() - start_time
+            if elapsed > 0:
+                speed_sec_sec = processed_sec / elapsed
+                speed_str = f"{speed_sec_sec:.1f} sec/sec"
+            else:
+                speed_str = "N/A"
+                
+            if sys.stdout.isatty():
+                sys.stdout.write(f"\rDenoising: [{bar}] {pct:.1f}% ({processed_sec:.1f}s/{total_sec:.1f}s) (Speed: {speed_str})")
+                sys.stdout.flush()
+            
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        else:
+            print("Denoising complete.")
+        return enhanced_audio
+
 def run_deepfilter_live(input_wav, output_dir):
+    if HAS_DF_API:
+        try:
+            print("Denoising audio using DeepFilterNet Python API...")
+            model, df_state, _ = init_df(log_level="ERROR", log_file=None)
+            df_sr = ModelParams().sr
+            
+            audio, meta = load_audio(input_wav, sr=df_sr)
+            
+            enhanced = enhance_chunked(
+                model=model,
+                df_state=df_state,
+                audio=audio,
+                chunk_len_sec=10.0,
+                overlap_sec=1.0,
+                atten_lim_db=None
+            )
+            
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, os.path.basename(input_wav))
+            save_audio(output_file, enhanced, sr=df_sr, log=False)
+            return
+        except Exception as e:
+            print(f"Python API denoising failed: {e}. Falling back to command-line utility...")
+
     cmd = ["deepFilter", input_wav, "-o", output_dir, "--no-suffix"]
-    
+    print(f"Running command: {shlex.join(cmd)}")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Run the process and capture combined output
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    
-    # Read output character-by-character to preserve formatting and progress updates in real-time
     try:
         while True:
             char = process.stdout.read(1)
