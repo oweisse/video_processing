@@ -285,7 +285,10 @@ def format_time_filename(seconds):
     return f"{mins:02d}m{secs:02d}s"
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract audio, run DeepFilterNet, and optionally merge it back into a video.")
+    parser = argparse.ArgumentParser(
+        description="Extract audio, run DeepFilterNet, and optionally merge it back into a video.",
+        allow_abbrev=False
+    )
     parser.add_argument(
         "input_video",
         type=str,

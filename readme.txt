@@ -52,3 +52,45 @@ Examples
 3. Process the first 10 seconds of a video, normalize and add a 6dB boost, then merge back to MP4:
 
    python3 extract_and_filter_audio.py /path/to/video.mp4 --process_n_seconds 10 --normalize --audio_gain 6dB
+
+4. Process a wedding video starting at 8m50s for 3m30s, merging the denoised audio back into the video with normalization and a 12dB boost:
+
+   python3 extract_and_filter_audio.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 8m50s --process_n_seconds 3m30s --normalize --audio_gain 12dB
+
+
+Video Enhancement Tool (improve_video.py)
+========================================
+
+This script uses Real-ESRGAN (via Vulkan/Metal on macOS) to upscale and enhance the visual quality of old or low-resolution video recordings (such as VHS tape rips).
+
+Installation & Setup
+--------------------
+To automatically download and configure the portable macOS Real-ESRGAN binary and models:
+
+  chmod +x setup_video_tool.sh
+  ./setup_video_tool.sh
+
+Usage
+-----
+python3 improve_video.py [input_video] [options]
+
+Options:
+  -o, --output           Path for the output file. Defaults to same directory as input with suffix.
+  --skip_first_n_sec     Skip the specified duration at the start of the video (e.g. '1m30s', '10m').
+  --process_n_seconds    Only process the specified duration (e.g. '1m30s', '2m').
+  -s, --scale            Scaling factor (2, 3, or 4; default: 4).
+  -m, --model            Model name (default: realesrgan-x4plus).
+  --deinterlace          De-interlace video frames using FFmpeg's yadif filter (critical for restoring VHS).
+  --denoise              Apply advanced temporal and spatial denoising (atadenoise + hqdn3d) before upscaling.
+
+Examples
+--------
+1. Process a slice of the wedding video from minute 8:30 to 12:30 (4 minutes duration):
+
+   python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 8m30s --process_n_seconds 4m
+
+2. Upscale a 10-second slice at 2x scale, with de-interlacing and denoising enabled (highly recommended for noisy VHS):
+
+   python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 9m30s --process_n_seconds 10s --scale 2 --deinterlace --denoise
+
+
