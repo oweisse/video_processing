@@ -9,6 +9,9 @@ import sys
 import tempfile
 import time
 
+# Set MPS memory watermark ratio to 0.0 to allow PyTorch to utilize the full unified memory pool
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
 # ANSI escape codes for styling (only used if stdout is a TTY)
 COLOR_BLUE = "\033[94m"
 COLOR_GREEN = "\033[92m"
@@ -428,8 +431,39 @@ def main():
         action="store_true",
         help="Apply high-quality spatial/temporal denoising (atadenoise + hqdn3d) before upscaling. (Recommended for noisy VHS footage)"
     )
+    parser.add_argument(
+        "--face_restoration",
+        action="store_true",
+        help="Enable Option 1: GFP-GAN face restoration on top of Real-ESRGAN upscaling."
+    )
+    parser.add_argument(
+        "--generative_upscale",
+        action="store_true",
+        help="Enable Option 2: Stable Diffusion + ControlNet Tile generative upscaling."
+    )
+    parser.add_argument(
+        "--only_ai_process_n_frames",
+        type=int,
+        default=None,
+        help="For testing: Only process the specified number of frames and copy them locally."
+    )
 
     args = parser.parse_args()
+
+    # Enforce mutual exclusivity of Option 1 and Option 2
+    if args.face_restoration and args.generative_upscale:
+        parser.error("Arguments --face_restoration and --generative_upscale are mutually exclusive. Choose only one.")
+
+    # Auto-switch to virtual environment python if available and needed
+    if args.face_restoration or args.generative_upscale:
+        try:
+            import torchvision
+        except ImportError:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            venv_python = os.path.join(script_dir, "venv_ai", "bin", "python3")
+            if os.path.exists(venv_python):
+                print(f"{COLOR_YELLOW}[Info] Auto-switching to local AI virtual environment (venv_ai)...{COLOR_RESET}", flush=True)
+                os.execv(venv_python, [venv_python] + sys.argv)
 
     # 1. Validate Input File
     if not os.path.exists(args.input_video):
@@ -472,6 +506,10 @@ def main():
     else:
         duration = min(duration, original_duration - start_sec)
         
+    if args.only_ai_process_n_frames is not None:
+        test_duration = (args.only_ai_process_n_frames + 0.5) / fps
+        duration = min(duration, test_duration)
+        
     if duration <= 0:
         print_error("Processing duration must be greater than 0.")
         sys.exit(1)
@@ -494,10 +532,17 @@ def main():
     if args.skip_first_n_sec:
         print(f"Skipping the first {start_sec:.1f} seconds of the video.", flush=True)
     print(f"Limiting processing to {duration:.1f} seconds.", flush=True)
-    print(f"Model:        {args.model} (Requested Scale: {args.scale}x, Native Upscaling Scale: {run_scale}x)", flush=True)
+    if args.generative_upscale:
+        print(f"Method:       Option 2: Stable Diffusion Generative Upscale (Scale: {args.scale}x)", flush=True)
+    elif args.face_restoration:
+        print(f"Method:       Option 1: Face Restoration + Real-ESRGAN (Scale: {args.scale}x)", flush=True)
+    else:
+        print(f"Method:       Standard Real-ESRGAN Upscale (Requested Scale: {args.scale}x, Native Scale: {run_scale}x)", flush=True)
     print(f"Video FPS:    {fps:.2f}", flush=True)
     print(f"Deinterlace:  {'Enabled (yadif)' if args.deinterlace else 'Disabled'}", flush=True)
     print(f"Denoise:      {'Enabled (atadenoise + hqdn3d)' if args.denoise else 'Disabled'}", flush=True)
+    if args.only_ai_process_n_frames is not None:
+        print(f"Testing Limit:Only processing first {args.only_ai_process_n_frames} frames.", flush=True)
 
     # 6. Execute Upscaling Pipeline using Temporary Directory
     total_steps = 4
@@ -538,11 +583,95 @@ def main():
             total_frames_est=total_frames_est,
             scale=run_scale
         )
+
+        # Handle testing frame limit by deleting extra extracted frames
+        if args.only_ai_process_n_frames is not None:
+            extracted_files = sorted([f for f in os.listdir(input_frames_dir) if f.endswith(".png")])
+            for f in extracted_files[args.only_ai_process_n_frames:]:
+                os.remove(os.path.join(input_frames_dir, f))
         
-        # Step 2: Upscale Frames (always running at the model's native scale)
-        print_step(2, total_steps, "Upscaling video frames using Real-ESRGAN")
-        models_dir = os.path.join(os.path.dirname(bin_path), "models")
-        run_upscaler_with_progress(bin_path, models_dir, input_frames_dir, output_frames_dir, args.model, run_scale)
+        # Step 2: Upscale / Enhance Frames
+        if args.generative_upscale:
+            print_step(2, total_steps, "Upscaling video frames using Stable Diffusion + ControlNet Tile")
+            try:
+                import ai_restoration
+            except ImportError as e:
+                print_error("Failed to load generative AI dependencies. Did you run the setup script?")
+                print_error(f"Error details: {e}")
+                sys.exit(1)
+                
+            def sd_progress(current, total):
+                pct = (current / total) * 100
+                sys.stdout.write(f"\rGenerative Upscale: {pct:.1f}% ({current}/{total} frames)")
+                sys.stdout.flush()
+                
+            ai_restoration.upscale_generative_sd(
+                input_dir=input_frames_dir,
+                output_dir=output_frames_dir,
+                scale=args.scale,
+                limit_frames=args.only_ai_process_n_frames,
+                progress_callback=sd_progress
+            )
+            print()
+            rename_completed_output_frames(output_frames_dir, finished=True)
+            
+        else:
+            # If Option 1 is enabled, apply GFP-GAN face restoration on the low-res input frames first
+            if args.face_restoration:
+                print_step(2, total_steps, "Applying GFP-GAN face restoration on low-res input frames")
+                try:
+                    import ai_restoration
+                except ImportError as e:
+                    print_error("Failed to load face restoration dependencies. Did you run the setup script?")
+                    print_error(f"Error details: {e}")
+                    sys.exit(1)
+                    
+                def gfp_progress(current, total):
+                    pct = (current / total) * 100
+                    sys.stdout.write(f"\rFace Restoration (Low-Res): {pct:.1f}% ({current}/{total} frames)")
+                    sys.stdout.flush()
+                
+                temp_gfp_dir = os.path.join(tmp_dir, "gfp_input_restored")
+                ai_restoration.enhance_faces_gfpgan(
+                    input_dir=input_frames_dir,
+                    output_dir=temp_gfp_dir,
+                    limit_frames=args.only_ai_process_n_frames,
+                    progress_callback=gfp_progress
+                )
+                print()
+                # Overwrite files in input_frames_dir with face restored ones
+                for filename in os.listdir(temp_gfp_dir):
+                    shutil.move(os.path.join(temp_gfp_dir, filename), os.path.join(input_frames_dir, filename))
+
+            # Run standard Real-ESRGAN upscaler first
+            print_step(2, total_steps, "Upscaling video frames using Real-ESRGAN")
+            models_dir = os.path.join(os.path.dirname(bin_path), "models")
+            run_upscaler_with_progress(bin_path, models_dir, input_frames_dir, output_frames_dir, args.model, run_scale)
+
+        # Handle testing early exit (copy output frames locally and quit)
+        if args.only_ai_process_n_frames is not None:
+            if args.face_restoration:
+                local_out_dir = "output_images_face_restoration"
+            elif args.generative_upscale:
+                local_out_dir = "output_images_generative_upscale"
+            else:
+                local_out_dir = "output_images_realesrgan"
+                
+            local_out_path = os.path.join(os.getcwd(), local_out_dir)
+            if os.path.exists(local_out_path):
+                shutil.rmtree(local_out_path)
+            os.makedirs(local_out_path, exist_ok=True)
+            
+            # Copy PNG files prepending start time
+            copied_count = 0
+            for filename in os.listdir(output_frames_dir):
+                if filename.endswith(".png"):
+                    new_name = filename.replace("output_frame_", f"output_frame_{start_fmt}_")
+                    shutil.copy(os.path.join(output_frames_dir, filename), os.path.join(local_out_path, new_name))
+                    copied_count += 1
+                    
+            print_success(f"\nTesting mode complete! {copied_count} frames saved to local folder: {local_out_path}")
+            sys.exit(0)
         
         # Step 3: Extract Audio Track Slice
         print_step(3, total_steps, "Extracting audio track slice")

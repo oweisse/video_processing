@@ -61,27 +61,38 @@ Examples
 Video Enhancement Tool (improve_video.py)
 ========================================
 
-This script uses Real-ESRGAN (via Vulkan/Metal on macOS) to upscale and enhance the visual quality of old or low-resolution video recordings (such as VHS tape rips).
+This script uses Real-ESRGAN (via Vulkan/Metal on macOS) and generative machine learning models to upscale and enhance the visual quality of old or low-resolution video recordings (such as VHS tape rips).
 
 Installation & Setup
 --------------------
-To automatically download and configure the portable macOS Real-ESRGAN binary and models:
+1. To configure the portable macOS Real-ESRGAN upscaler binary and models:
 
-  chmod +x setup_video_tool.sh
-  ./setup_video_tool.sh
+     chmod +x setup_video_tool.sh
+     ./setup_video_tool.sh
+
+2. To initialize the Python AI/ML virtual environment and install dependencies (PyTorch, Diffusers, GFP-GAN):
+
+     chmod +x setup_ai.sh
+     ./setup_ai.sh
 
 Usage
 -----
 python3 improve_video.py [input_video] [options]
 
+Note: If using generative flags (--face_restoration or --generative_upscale), make sure to activate the AI environment first:
+  source venv_ai/bin/activate
+
 Options:
-  -o, --output           Path for the output file. Defaults to same directory as input with suffix.
-  --skip_first_n_sec     Skip the specified duration at the start of the video (e.g. '1m30s', '10m').
-  --process_n_seconds    Only process the specified duration (e.g. '1m30s', '2m').
-  -s, --scale            Scaling factor (2, 3, or 4; default: 4).
-  -m, --model            Model name (default: realesrgan-x4plus).
-  --deinterlace          De-interlace video frames using FFmpeg's yadif filter (critical for restoring VHS).
-  --denoise              Apply advanced temporal and spatial denoising (atadenoise + hqdn3d) before upscaling.
+  -o, --output                 Path for the output file.
+  --skip_first_n_sec           Skip the specified duration at the start of the video (e.g. '1m30s', '10m').
+  --process_n_seconds          Only process the specified duration (e.g. '1m30s', '2m').
+  -s, --scale                  Scaling factor (2, 3, or 4; default: 4).
+  -m, --model                  Model name (default: realesrgan-x4plus).
+  --deinterlace                De-interlace video frames using FFmpeg's yadif filter (critical for restoring VHS).
+  --denoise                    Apply advanced temporal and spatial denoising (atadenoise + hqdn3d) before upscaling.
+  --face_restoration           Apply Option 1: GFP-GAN face restoration on top of Real-ESRGAN upscaled frames to fix waxy faces.
+  --generative_upscale         Apply Option 2: Stable Diffusion + ControlNet Tile generative upscaling.
+  --only_ai_process_n_frames N For testing: Only process the first N frames, write output PNGs locally, and exit early.
 
 Examples
 --------
@@ -89,8 +100,19 @@ Examples
 
    python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 8m30s --process_n_seconds 4m
 
-2. Upscale a 10-second slice at 2x scale, with de-interlacing and denoising enabled (highly recommended for noisy VHS):
+2. Upscale a 10-second slice at 2x scale, with de-interlacing and denoising enabled:
 
    python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 9m30s --process_n_seconds 10s --scale 2 --deinterlace --denoise
+
+3. Test face restoration (Option 1) on the first 3 frames of a wedding video scene:
+
+   source venv_ai/bin/activate
+   python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 9m30s --deinterlace --denoise --face_restoration --only_ai_process_n_frames 3
+
+4. Test generative upscaling (Option 2) on a single frame:
+
+   source venv_ai/bin/activate
+   python3 improve_video.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 9m30s --deinterlace --denoise --generative_upscale --only_ai_process_n_frames 1
+
 
 
