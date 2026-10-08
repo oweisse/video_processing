@@ -22,9 +22,22 @@ dependencies = [
 
 [project.optional-dependencies]
 separation = ["demucs>=4.0.1"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 clean-audio = "video_audio_cleaner.cli:main"
 
 [tool.setuptools]
 packages = ["video_audio_cleaner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: runs the real DeepFilterNet / Demucs models (minutes). Run with -m slow.",
+    "demucs: the Demucs separation test, the slowest of the slow tier.",
+]
+filterwarnings = [
+    # DeepFilterNet 0.5.6 imports the relocated torchaudio.backend.common.
+    "ignore:.*torchaudio.backend.common.*:UserWarning",
+]

@@ -325,6 +325,55 @@ no music.
 
 ---
 
+## Development
+
+Install the test dependencies into the same environment:
+
+```bash
+./venv/bin/pip install -e ".[separation,dev]"
+```
+
+Two test tiers:
+
+```bash
+./venv/bin/pytest
+```
+
+runs the fast tier (ffmpeg-only: parsing, naming, keyframes, merge sync, latency,
+interrupt cleanup) in a few seconds.
+
+```bash
+./venv/bin/pytest -m slow
+```
+
+runs the slow tier against the real DeepFilterNet and Demucs models (well under a
+minute on an M3). Add `-m "slow and not demucs"` to skip the slowest test.
+
+Test material is synthesised on the fly by `tests/fixtures.py` — speech from macOS
+`say`, plus seeded hiss, a jittered click train and a music bed — so no recordings are
+needed and results are reproducible. The suite skips itself on machines without `say`.
+
+Known bugs are pinned as `xfail(strict=True)` tests until fixed: a strict xfail that
+starts passing fails the run, so a fix can't land silently.
+
+### Measuring audio
+
+Every number quoted in this README comes from `video_audio_cleaner/metrics.py`:
+
+```bash
+./venv/bin/python -m video_audio_cleaner.metrics processed.wav
+```
+
+```bash
+./venv/bin/python -m video_audio_cleaner.metrics original.wav processed.wav
+```
+
+The first prints speech-to-hiss, warble and clicks/sec; the second adds speech
+fidelity against the original. All four are level-independent, so a gain change alone
+does not move them.
+
+---
+
 # 2. Video Enhancement (`improve_video.py`)
 
 Uses Real-ESRGAN (via Vulkan/Metal on macOS) and generative models to upscale and enhance

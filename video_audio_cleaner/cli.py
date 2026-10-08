@@ -204,6 +204,25 @@ def _validate_output_name(name):
     return name
 
 
+def derive_output_name(input_path, requested_start, requested_duration, file_duration,
+                       has_window, compare_mode, audio_only):
+    """Output filename: the input's name plus the window the user asked for."""
+    base_name, _ = os.path.splitext(os.path.basename(input_path))
+    time_suffix = ""
+    if has_window:
+        if requested_duration is not None:
+            end_sec = requested_start + requested_duration
+        else:
+            end_sec = file_duration
+        time_suffix = (f"_{format_time_filename(requested_start)}"
+                       f"-{format_time_filename(end_sec)}")
+    if compare_mode:
+        return f"{base_name}_compare{time_suffix}.wav"
+    if audio_only:
+        return f"{base_name}{time_suffix}.wav"
+    return f"{base_name}{time_suffix}.mp4"
+
+
 def _partial_path(final_path):
     base, ext = os.path.splitext(final_path)
     return f"{base}.partial{ext}"
@@ -295,24 +314,16 @@ def _run(args):
     else:
         work_duration = None
 
-    # Output naming reflects the window the user asked for.
-    _, input_filename = os.path.split(input_path)
-    base_name, _ = os.path.splitext(input_filename)
-    time_suffix = ""
-    if args.skip_first_n_sec is not None or args.process_n_seconds is not None or compare_mode:
-        if requested_duration is not None:
-            end_sec = requested_start + requested_duration
-        else:
-            end_sec = file_duration
-        time_suffix = (f"_{format_time_filename(requested_start)}"
-                       f"-{format_time_filename(end_sec)}")
-
-    if compare_mode:
-        default_name = f"{base_name}_compare{time_suffix}.wav"
-    elif args.filter_audio_only:
-        default_name = f"{base_name}{time_suffix}.wav"
-    else:
-        default_name = f"{base_name}{time_suffix}.mp4"
+    default_name = derive_output_name(
+        input_path=input_path,
+        requested_start=requested_start,
+        requested_duration=requested_duration,
+        file_duration=file_duration,
+        has_window=(args.skip_first_n_sec is not None
+                    or args.process_n_seconds is not None or compare_mode),
+        compare_mode=compare_mode,
+        audio_only=args.filter_audio_only,
+    )
     output_path = os.path.join(output_dir, args.output or default_name)
 
     # The derived name is now just the input's name plus the window, so with no
