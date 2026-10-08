@@ -1,0 +1,196 @@
+"""ffmpeg/ffprobe helpers: probing, progress-reporting runs, and loudness analysis."""
+import json
+import re
+import shlex
+import subprocess
+import tempfile
+
+from . import procs
+from .console import print_info
+from .progress import ProgressReporter
+
+
+def _run_capture(cmd, timeout=120):
+    """Run a short-lived command and capture its output as text."""
+    proc = procs.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    finally:
+        if proc.poll() is None:
+            procs.terminate(proc)
+        else:
+            procs.untrack(proc)
+    return proc.returncode, out, err
+
+
+def probe_duration(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        rc, out, _ = _run_capture(cmd)
+        if rc == 0:
+            return float(out.strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def has_video_stream(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        rc, out, _ = _run_capture(cmd)
+        return rc == 0 and "video" in out
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def probe_keyframe_at_or_before(path, start_sec, lookbacks=(15.0, 60.0, 240.0)):
+    """Presentation time of the last video keyframe at or before start_sec.
+
+    Stream-copy seeking always lands on a keyframe, so cutting audio at an
+    arbitrary timestamp while copying video desynchronises the two by up to one
+    GOP. Returns None when no keyframe can be found (caller falls back).
+    """
+    if start_sec is None:
+        return None
+    if start_sec <= 0:
+        return 0.0
+
+    for lookback in lookbacks:
+        window_start = max(0.0, start_sec - lookback)
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-of", "csv=print_section=0",
+            "-read_intervals", f"{window_start:.3f}%{start_sec + 0.1:.3f}",
+            path,
+        ]
+        try:
+            rc, out, _ = _run_capture(cmd)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if rc != 0:
+            return None
+
+        best = None
+        for line in out.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                ts = float(parts[0])
+            except ValueError:
+                continue
+            if "K" not in parts[1]:
+                continue
+            if ts <= start_sec + 1e-6 and (best is None or ts > best):
+                best = ts
+        if best is not None:
+            return best
+        if window_start <= 0.0:
+            break
+    return None
+
+
+def run_ffmpeg(cmd_args, duration, prefix, quiet=False):
+    """Run ffmpeg, rendering the shared progress bar. Returns captured stderr."""
+    cmd = list(cmd_args) + ["-progress", "-", "-nostats"]
+    if not quiet:
+        print_info(f"Running command: {shlex.join(cmd)}")
+
+    reporter = ProgressReporter(prefix, duration)
+    # stderr goes to a file rather than a pipe: we only drain stdout during the
+    # run, and a full stderr pipe buffer would deadlock ffmpeg.
+    stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    proc = procs.popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
+    speed = None
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us="):
+                raw = line.split("=", 1)[1]
+                try:
+                    reporter.update(int(raw) / 1_000_000.0, speed)
+                except ValueError:
+                    pass
+            elif line.startswith("speed="):
+                raw_speed = line.split("=", 1)[1].strip()
+                if raw_speed.endswith("x"):
+                    speed = f"{raw_speed[:-1]} sec/sec"
+                elif raw_speed and raw_speed != "N/A":
+                    speed = raw_speed
+        proc.wait()
+        stderr_file.seek(0)
+        stderr_text = stderr_file.read()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr_text)
+        reporter.finish(speed)
+        return stderr_text
+    finally:
+        if proc.poll() is None:
+            procs.terminate(proc)
+        else:
+            procs.untrack(proc)
+        stderr_file.close()
+
+
+def _parse_loudnorm_json(stderr_text):
+    last = None
+    for match in re.finditer(r"\{[^{}]*\}", stderr_text, re.S):
+        last = match
+    if last is None:
+        return None
+    try:
+        return json.loads(last.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _finite(value):
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return False
+    return num == num and abs(num) != float("inf")
+
+
+def measure_loudness(path, target_lufs, target_tp, target_lra, duration=None,
+                     label="Analyzing loudness"):
+    """First loudnorm pass: measure the file. Returns the stats dict or None."""
+    filt = (f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
+            f":print_format=json")
+    cmd = ["ffmpeg", "-y", "-i", path, "-af", filt, "-f", "null", "-"]
+    stderr_text = run_ffmpeg(cmd, duration, label)
+    stats = _parse_loudnorm_json(stderr_text)
+    if not stats:
+        return None
+    required = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(_finite(stats.get(key)) for key in required):
+        # Silent or near-silent input; linear normalisation is not possible.
+        return None
+    return stats
+
+
+def loudnorm_filter(target_lufs, target_tp, target_lra, measured=None):
+    base = f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
+    if not measured:
+        return base
+    return (f"{base}"
+            f":measured_I={measured['input_i']}"
+            f":measured_TP={measured['input_tp']}"
+            f":measured_LRA={measured['input_lra']}"
+            f":measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}"
+            f":linear=true")

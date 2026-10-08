@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-audio-cleaner"
+version = "0.2.0"
+description = "Extract, denoise, and re-merge speech audio in videos (DeepFilterNet + optional Demucs)"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "deepfilternet>=0.5.6",
+    # DeepFilterNet 0.5.6 (the latest release) imports torchaudio.backend.common,
+    # which torchaudio removed in 2.2. Do not raise these pins without checking
+    # that df/io.py still imports.
+    "torch>=2.1,<2.2",
+    "torchaudio>=2.1,<2.2",
+    "soundfile>=0.12",
+    # DeepFilterNet 0.5.x is not numpy-2 clean.
+    "numpy>=1.24,<2.0",
+]
+
+[project.optional-dependencies]
+separation = ["demucs>=4.0.1"]
+
+[project.scripts]
+clean-audio = "video_audio_cleaner.cli:main"
+
+[tool.setuptools]
+packages = ["video_audio_cleaner"]

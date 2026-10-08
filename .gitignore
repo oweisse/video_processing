@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+venv/
+venv_ai/
+
+# Downloaded model weights and portable binaries
+weights/
+bin/
+gfpgan/
+
+# Test / scratch artifacts
+output_images_face_restoration/
+output_images_generative_upscale/
+output_test_*.png
+test_frame_*.png
+
+.DS_Store

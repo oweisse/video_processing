@@ -55,7 +55,7 @@ Examples
 
 4. Process a wedding video starting at 8m50s for 3m30s, merging the denoised audio back into the video with normalization and a 12dB boost:
 
-   python3 extract_and_filter_audio.py "/Users/ofir/Documents/video_processing_temp/02-חתונה.mp4" --skip_first_n_sec 8m50s --process_n_seconds 3m30s --normalize --audio_gain 12dB
+   python3 extract_and_filter_audio.py "/Users/ofir/Documents/video_processing_temp/02-wedding.mp4" --skip_first_n_sec 8m50s --process_n_seconds 3m30s --normalize --audio_gain 12dB
 
 
 Video Enhancement Tool (improve_video.py)
