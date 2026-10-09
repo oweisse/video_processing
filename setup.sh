@@ -39,11 +39,11 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. Pick a supported Python
-#    DeepFilterNet 0.5.6 needs torch/torchaudio < 2.2, which have no wheels for
-#    Python 3.13+. Anything in 3.10 - 3.12 works.
+#    DeepFilterLib 0.5.6 (DeepFilterNet's Rust core) ships macOS wheels only up
+#    to CPython 3.11, so 3.12+ would need a Rust toolchain to build it.
 # ---------------------------------------------------------------------------
 PYTHON_BIN=""
-for candidate in python3.12 python3.11 python3.10; do
+for candidate in python3.11 python3.10; do
     if command -v "$candidate" &> /dev/null; then
         PYTHON_BIN="$(command -v "$candidate")"
         break
@@ -52,15 +52,15 @@ done
 
 if [ -z "$PYTHON_BIN" ]; then
     if command -v python3 &> /dev/null; then
-        if python3 -c 'import sys; sys.exit(0 if (3,10) <= sys.version_info < (3,13) else 1)'; then
+        if python3 -c 'import sys; sys.exit(0 if (3,10) <= sys.version_info < (3,12) else 1)'; then
             PYTHON_BIN="$(command -v python3)"
         fi
     fi
 fi
 
 if [ -z "$PYTHON_BIN" ]; then
-    echo -e "${COLOR_RED}Error: no Python between 3.10 and 3.12 found.${COLOR_RESET}"
-    echo -e "Install one, for example:  ${COLOR_BOLD}brew install python@3.12${COLOR_RESET}"
+    echo -e "${COLOR_RED}Error: no Python 3.10 or 3.11 found.${COLOR_RESET}"
+    echo -e "Install one, for example:  ${COLOR_BOLD}brew install python@3.11${COLOR_RESET}"
     exit 1
 fi
 
@@ -83,19 +83,17 @@ echo -e "${COLOR_BLUE}Upgrading pip ...${COLOR_RESET}"
 # 4. Install the project (with Demucs separation extra)
 # ---------------------------------------------------------------------------
 echo -e "${COLOR_BLUE}Installing video-audio-cleaner and dependencies (this downloads PyTorch; it takes a few minutes) ...${COLOR_RESET}"
-./venv/bin/pip install -e ".[separation]"
+./venv/bin/pip install -e ".[separation,dev]"
 
 # ---------------------------------------------------------------------------
 # 5. Smoke test
 # ---------------------------------------------------------------------------
 echo -e "\n${COLOR_BLUE}Verifying the installation ...${COLOR_RESET}"
 ./venv/bin/python - <<'PY'
-import warnings
-warnings.filterwarnings("ignore")
 import torch, torchaudio, soundfile           # noqa: F401
-from df.enhance import init_df, enhance       # noqa: F401
-from df.io import load_audio                  # noqa: F401
+from video_audio_cleaner import denoise       # loads DeepFilterNet through our shim
 import demucs.api                             # noqa: F401
+assert denoise.HAS_DF_API, "DeepFilterNet failed to load"
 print("  torch", torch.__version__, "| torchaudio", torchaudio.__version__)
 print("  DeepFilterNet: OK")
 print("  Demucs: OK")

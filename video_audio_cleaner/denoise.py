@@ -10,22 +10,57 @@ import subprocess
 import sys
 
 from . import procs
-from .audioio import write_wav
+from .audioio import read_audio, write_wav
 from .console import print_info, print_warning
 from .progress import ProgressReporter
 
 HAS_DF_API = False
 torch = None
+
+
+def _install_torchaudio_shim():
+    """Let DeepFilterNet 0.5.6 import on torchaudio >= 2.2.
+
+    df/io.py does `from torchaudio.backend.common import AudioMetaData`, a module
+    torchaudio removed. We never call DeepFilterNet's audio I/O (we read files
+    ourselves, see audioio.read_audio), so restoring just that name is enough.
+    """
+    import sys
+    import types
+
+    import torchaudio
+
+    if "torchaudio.backend.common" in sys.modules:
+        return
+    try:
+        import torchaudio.backend.common  # noqa: F401  (older torchaudio: the real module)
+        return
+    except ImportError:
+        pass
+    meta = getattr(torchaudio, "AudioMetaData", None)
+    if meta is None:
+        from dataclasses import make_dataclass
+        meta = make_dataclass("AudioMetaData", ["sample_rate", "num_frames",
+                                                "num_channels", "bits_per_sample",
+                                                "encoding"])
+    shim = types.ModuleType("torchaudio.backend.common")
+    shim.AudioMetaData = meta
+    backend = sys.modules.setdefault("torchaudio.backend",
+                                     types.ModuleType("torchaudio.backend"))
+    backend.common = shim
+    sys.modules["torchaudio.backend.common"] = shim
+
+
 try:
     import warnings
 
     import torch
 
+    _install_torchaudio_shim()
     with warnings.catch_warnings():
-        # DeepFilterNet 0.5.6 still imports the relocated torchaudio.backend.common.
+        # Older torchaudio warns that backend.common moved.
         warnings.filterwarnings("ignore", message=r".*torchaudio\.backend\.common.*")
         from df.enhance import enhance, init_df
-        from df.io import load_audio
 
     HAS_DF_API = True
 except (ImportError, OSError):
@@ -144,7 +179,7 @@ def denoise_file(input_wav, output_wav, atten_lim_db=None, chunk_len_sec=10.0,
 
     model, df_state, _ = init_df(log_level="ERROR", log_file=None)
     sr = df_state.sr()
-    audio, _ = load_audio(input_wav, sr=sr)
+    audio, _ = read_audio(input_wav, target_sr=sr)
     enhanced = enhance_chunked(
         model=model,
         df_state=df_state,

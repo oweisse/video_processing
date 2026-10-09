@@ -35,8 +35,10 @@ they re-generate speech from a degraded input and can subtly change how people s
 ```
 
 This installs FFmpeg (via Homebrew), creates `./venv`, and installs the project with the
-Demucs extra. It picks a Python between 3.10 and 3.12 automatically — DeepFilterNet 0.5.6
-requires `torch`/`torchaudio` < 2.2, which have no wheels for Python 3.13+.
+Demucs extra and the test tools. It picks Python 3.11 or 3.10 automatically: DeepFilterNet's
+Rust core (DeepFilterLib 0.5.6) only ships macOS wheels up to 3.11, so newer Pythons would
+need a Rust toolchain. Any recent PyTorch works — DeepFilterNet 0.5.6 predates current
+torchaudio, and `denoise.py` bridges the two (a slow test guards it).
 
 Then run the tool with either:
 

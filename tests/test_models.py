@@ -32,8 +32,12 @@ def denoised(fx, tmp_path_factory):
     return out
 
 
-def test_deepfilternet_imports():
-    import df.enhance  # noqa: F401  (guards the torch/torchaudio pin, Phase 4)
+def test_deepfilternet_loads_on_installed_torchaudio():
+    """Guards the torch/torchaudio unpin: DeepFilterNet must load via our shim."""
+    import torchaudio
+
+    from video_audio_cleaner import denoise
+    assert denoise.HAS_DF_API, f"DeepFilterNet failed to load with torchaudio {torchaudio.__version__}"
 
 
 def test_denoise_removes_hiss_monotonically(fx, denoised):
