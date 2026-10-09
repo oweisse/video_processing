@@ -75,8 +75,46 @@ extract (raw 32-bit float, 48 kHz)
                            └─> merge into video (or write WAV)
 ```
 
-Every stage prints a live progress bar with percentage, position and speed. When output
-is piped to a file, it prints a plain progress line every 5 seconds instead.
+Everything after DeepFilterNet runs as a single ffmpeg filter graph: one pass to measure
+loudness (only with `--normalize`), one pass to render. Intermediate files are written
+only at the boundaries above, and the loudness the tool reports is measured on the final
+audio — after the music bed and declick — not on an intermediate.
+
+### What you see while it runs
+
+The full stage chain is printed once, before any work starts. Each *pass* then gets a
+numbered header, a live bar with speed and ETA, and ✔ lines. The render pass covers
+several stages at once, so its header names them, and it prints one ✔ per stage when it
+finishes. Its single bar is accurate for all of them: every filter in one graph is at the
+same point in the audio, so 40 % means each stage is 40 % through.
+
+```
+Stages:       extract → denoise (atten 20) → hiss (profile, nr 12) → loudnorm (-16 LUFS) → declick (nr 12) → merge
+
+[1/5] Extracting audio track from video
+Extracting: [██████████████████████████████] 100.0% (31.0s/31.0s) 1680 sec/sec, took 0:00
+✔ Audio extracted (unfiltered 32-bit float).
+
+[2/5] Filtering noise using DeepFilterNet
+Denoising: [███████████████████-----------] 64.5% (20.0s/31.0s) 20.9 sec/sec, ETA 0:01
+
+[3/5] Analysing loudness (hiss → loudnorm measure)
+✔ Measured -18.4 LUFS before normalising.
+
+[4/5] Rendering: hiss → loudnorm → declick
+Rendering hiss→loudnorm→declick: [██████████████████████████████] 100.0% (31.0s/31.0s) 88.7 sec/sec, took 0:00
+✔ Hiss reduction (profile, nr 12) — noise sampled at 3.00s
+✔ Loudness normalised (two-pass, linear, target -16 LUFS)
+✔ Declick (nr 12)
+✔ Final audio: -16.1 LUFS, true peak -5.6 dBTP (target -16)
+
+[5/5] Merging cleaned audio track back into video
+```
+
+When output is piped to a file, bars are replaced by a plain line every 5 seconds
+(`Denoising: 64.5% (20.0s/31.0s), ETA 0:01`). ffmpeg command lines are hidden by default
+— a render graph is several hundred characters — and shown with `--verbose`; a failing
+command is always printed with its error.
 
 ## Options
 
@@ -115,7 +153,8 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--precise_cut` | off | Exact cut instead of keyframe snap — re-encodes the video. |
 | `--video_crf` | `18` | x264 quality for `--precise_cut`. |
 | `--audio_bitrate` | `192k` | AAC bitrate of the merged video. |
-| `--keep_temp DIR` | off | Copy intermediate WAVs to DIR for debugging. |
+| `--keep_temp DIR` | off | Copy intermediates to DIR: `01_raw`, `02_vocals`/`02_music`, `03_denoised`, `04_final`. |
+| `--verbose` | off | Print every ffmpeg command line before running it. |
 
 **Advanced thresholds** — rarely needed; listed so nothing in the pipeline is a hidden
 constant:

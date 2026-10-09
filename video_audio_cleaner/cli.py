@@ -8,12 +8,13 @@ remove, and can clip.
 """
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 
-from . import ffmpeg_utils, procs
+from . import ffmpeg_utils, graph, procs
 from .console import print_error, print_info, print_step, print_success, print_warning
 from .timeparse import format_time_filename, parse_time_string, positive_time
 
@@ -26,9 +27,6 @@ DEFAULT_SILENCE_WARN_LUFS = -45.0
 DEFAULT_LOUDNESS_TOLERANCE_DB = 2.0
 DEFAULT_SEPARATION_AUTO_SEGMENT_SEC = 600.0
 
-
-def limiter(ceiling):
-    return f"alimiter=limit={ceiling:g}:level=false"
 
 
 # --------------------------------------------------------------------------
@@ -207,8 +205,12 @@ def build_parser():
                           help="Windows longer than this get a 7 s Demucs segment to "
                                "bound memory, seconds (default: 600).")
 
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print every ffmpeg command line before running it.")
     parser.add_argument("--keep_temp", type=str, default=None, metavar="DIR",
-                        help="Copy intermediate WAVs into DIR for debugging.")
+                        help="Copy intermediate WAVs into DIR for debugging: 01_raw, "
+                             "02_vocals/02_music (with --separate_music), 03_denoised, "
+                             "04_final (everything after DeepFilterNet).")
     return parser
 
 
@@ -299,8 +301,64 @@ def _format_failure(exc):
             lines = [line for line in str(exc.stderr).strip().splitlines() if line.strip()]
             if lines:
                 detail = "\n" + "\n".join(lines[-12:])
-        return f"Command failed with exit code {exc.returncode}.{detail}"
+        command = exc.cmd if isinstance(exc.cmd, str) else shlex.join(map(str, exc.cmd))
+        return (f"Command failed with exit code {exc.returncode}.{detail}\n\n"
+                f"Command:\n    {command}")
     return str(exc) or repr(exc)
+
+
+def _stage_chain(args, o, compare_mode, audio_only):
+    atten = "unlimited" if args.atten_lim_db is None else f"{args.atten_lim_db:g}"
+    chain = ["extract"]
+    if args.separate_music:
+        chain.append("separate (Demucs)")
+    chain.append(f"denoise (atten {atten})")
+    if o.hiss_method == "profile":
+        chain.append(f"hiss (profile, nr {o.hiss_nr:g})")
+    elif o.hiss_method == "patch":
+        chain.append(f"hiss (patch, strength {o.hiss_strength:g})")
+    if o.normalize:
+        chain.append(f"loudnorm ({o.target_lufs:g} LUFS)")
+    if o.audio_gain:
+        chain.append(f"gain {o.audio_gain}")
+    if o.music_level_db is not None:
+        chain.append(f"music bed ({o.music_level_db:g} dB)")
+    elif args.separate_music:
+        chain.append("music dropped")
+    if o.declick:
+        chain.append(f"declick (nr {o.declick_nr:g})")
+    chain.append("A/B preview" if compare_mode else "write WAV" if audio_only else "merge")
+    return chain
+
+
+def _report_render(o, result, args):
+    """One line per stage the shared render pass performed, with what it did."""
+    if o.hiss_method == "profile":
+        print_success(f"Hiss reduction (profile, nr {o.hiss_nr:g}) — noise sampled at "
+                      f"{o.noise_at:.2f}s")
+    elif o.hiss_method == "patch":
+        print_success(f"Hiss reduction (patch, strength {o.hiss_strength:g})")
+    if o.normalize:
+        how = "two-pass, linear" if o.measured else "single-pass"
+        print_success(f"Loudness normalised ({how}, target {o.target_lufs:g} LUFS)")
+    if o.audio_gain:
+        print_success(f"Gain {o.audio_gain}, limited at {o.limiter_ceiling:g}")
+    if o.music_level_db is not None:
+        print_success(f"Music bed mixed back at {o.music_level_db:g} dB")
+    if o.declick:
+        print_success(f"Declick (nr {o.declick_nr:g})")
+
+    if result.lufs is None:
+        print_warning("Could not measure the loudness of the final audio.")
+        return
+    peak = "" if result.true_peak is None else f", true peak {result.true_peak:.1f} dBTP"
+    target = f" (target {o.target_lufs:g})" if o.normalize else ""
+    print_success(f"Final audio: {result.lufs:.1f} LUFS{peak}{target}")
+    if o.normalize and abs(result.lufs - o.target_lufs) > args.loudness_tolerance_db:
+        print_warning(
+            f"That is {abs(result.lufs - o.target_lufs):.1f} dB off the target. loudnorm "
+            f"caps its gain to keep the true peak under {o.target_tp:g} dBTP, so quiet, "
+            f"peaky material lands short. Use --audio_gain for a limited extra boost.")
 
 
 class _Steps:
@@ -403,20 +461,40 @@ def _run(args):
         print_warning("--audio_gain on top of --normalize is usually unnecessary; "
                       "the gain is applied after normalisation and then limited.")
 
-    do_normalize = args.normalize or args.audio_gain is not None
-    mix_music = args.separate_music and args.music_level_db is not None
+    graph_opts = graph.GraphOptions(
+        sample_rate=SAMPLE_RATE,
+        hiss_method=args.hiss_method if args.reduce_hiss else None,
+        hiss_nr=args.hiss_nr,
+        hiss_nf=args.hiss_nf,
+        hiss_gain_smooth=args.hiss_gain_smooth,
+        hiss_strength=args.hiss_strength,
+        hiss_window=args.hiss_window,
+        noise_len=args.noise_profile_len,
+        normalize=args.normalize,
+        target_lufs=args.target_lufs,
+        target_tp=args.target_tp,
+        target_lra=args.target_lra,
+        audio_gain=args.audio_gain,
+        limiter_ceiling=args.limiter_ceiling,
+        music_level_db=args.music_level_db if args.separate_music else None,
+        declick=args.declick,
+        declick_nr=args.declick_nr,
+        declick_nf=args.declick_nf,
+    )
+    render_stages = graph.stage_names(graph_opts)
+
+    # Rule: the user can always see which stages run, which pass is active and
+    # how far it is. Print the whole chain once, before any work starts.
+    print_info("Stages:       " + " → ".join(_stage_chain(args, graph_opts, compare_mode,
+                                                         audio_only)))
 
     total_steps = 2  # extract + denoise
     if args.separate_music:
         total_steps += 1
-    if do_normalize:
-        total_steps += 1
-    if mix_music:
-        total_steps += 1
-    if args.reduce_hiss:
-        total_steps += 1
-    if args.declick:
-        total_steps += 1
+    if args.normalize:
+        total_steps += 1  # loudness analysis pass
+    if render_stages:
+        total_steps += 1  # render pass
     total_steps += 1  # final output stage
     steps = _Steps(total_steps)
 
@@ -439,10 +517,7 @@ def _run(args):
         vocals_wav = os.path.join(temp_dir, "02_vocals.wav")
         music_wav = os.path.join(temp_dir, "02_music.wav")
         denoised_wav = os.path.join(temp_dir, "03_denoised.wav")
-        dehissed_wav = os.path.join(temp_dir, "03b_dehissed.wav")
-        normalized_wav = os.path.join(temp_dir, "04_normalized.wav")
-        mixed_wav = os.path.join(temp_dir, "05_mixed.wav")
-        declicked_wav = os.path.join(temp_dir, "06_declicked.wav")
+        final_wav = os.path.join(temp_dir, "04_final.wav")
 
         # -- Extract, completely unprocessed -------------------------------
         steps.start("Extracting audio track from video")
@@ -495,138 +570,43 @@ def _run(args):
         print_success("Audio filtered successfully.")
         processed_wav = denoised_wav
 
-        # -- Steady hiss / tape noise ---------------------------------------
-        # Placed before normalisation so the filter sees the recording's own
-        # noise floor rather than one boosted by tens of dB.
-        if args.reduce_hiss:
-            steps.start("Reducing steady background hiss")
-            from . import hiss
+        # -- Everything after DeepFilterNet: one analysis pass, one render pass
+        if render_stages:
+            from . import hiss, postprocess
 
-            if args.hiss_method == "profile":
-                hiss.reduce_hiss_profile(
-                    input_wav=processed_wav,
-                    output_wav=dehissed_wav,
-                    temp_dir=temp_dir,
-                    noise_reduction=args.hiss_nr,
-                    gain_smooth=args.hiss_gain_smooth,
-                    noise_floor=args.hiss_nf,
-                    noise_at=noise_at,
-                    noise_len=args.noise_profile_len,
-                    max_excess_db=args.noise_profile_max_excess_db,
-                    duration=work_duration,
-                    sample_rate=SAMPLE_RATE,
-                )
-                print_success(f"Hiss reduction applied "
-                              f"(learned profile, nr={args.hiss_nr:g}).")
-            else:
-                hiss.reduce_hiss_patch(
-                    input_wav=processed_wav,
-                    output_wav=dehissed_wav,
-                    strength=args.hiss_strength,
-                    window=args.hiss_window,
-                    duration=work_duration,
-                )
-                print_success(f"Hiss reduction applied "
-                              f"(patch, strength {args.hiss_strength:g}).")
-            processed_wav = dehissed_wav
+            if graph_opts.hiss_method == "profile":
+                graph_opts.noise_at = hiss.choose_noise_sample(
+                    denoised_wav, noise_at, args.noise_profile_len,
+                    args.noise_profile_max_excess_db)
+            graph_opts.latency = postprocess.measure_latencies(graph_opts)
 
-        # -- Loudness normalisation (after denoising) -----------------------
-        if do_normalize:
-            steps.start("Normalising loudness of the cleaned audio")
-            filters = []
             if args.normalize:
-                measured = ffmpeg_utils.measure_loudness(
-                    processed_wav, args.target_lufs, args.target_tp, args.target_lra, work_duration)
+                measured_on = ["hiss"] if graph_opts.hiss_method else []
+                steps.start("Analysing loudness ("
+                            + " → ".join(measured_on + ["loudnorm measure"]) + ")")
+                measured = postprocess.analyse(graph_opts, denoised_wav, work_duration,
+                                               label="Analysing loudness")
                 if measured is None:
                     print_warning("Loudness measurement unusable (near-silent input?); "
                                   "falling back to single-pass loudnorm.")
+                elif float(measured["input_i"]) < args.silence_warn_lufs:
+                    print_warning(
+                        f"Cleaned audio measures {float(measured['input_i']):.1f} LUFS, "
+                        f"which is close to silence. Normalising will apply a very large "
+                        f"boost — check --atten_lim_db is not stripping the speech.")
                 else:
-                    try:
-                        if float(measured["input_i"]) < args.silence_warn_lufs:
-                            print_warning(
-                                f"Cleaned audio measures {float(measured['input_i']):.1f} LUFS, "
-                                f"which is close to silence. Normalising will apply a very "
-                                f"large boost — check --atten_lim_db is not stripping the "
-                                f"speech."
-                            )
-                    except (KeyError, TypeError, ValueError):
-                        pass
-                filters.append(ffmpeg_utils.loudnorm_filter(
-                    args.target_lufs, args.target_tp, args.target_lra, measured))
-                # loudnorm works at 192 kHz internally; come back down before any
-                # sample-counted filter (the latency compensation counts samples).
-                filters.append(f"aresample={SAMPLE_RATE}")
-            if args.audio_gain:
-                filters.append(f"volume={args.audio_gain}")
-                filters.append(ffmpeg_utils.compensated(limiter(args.limiter_ceiling), SAMPLE_RATE))
+                    print_success(f"Measured {float(measured['input_i']):.1f} LUFS "
+                                  f"before normalising.")
+                graph_opts.measured = measured
 
-            norm_cmd = ["ffmpeg", "-y", "-i", processed_wav,
-                        "-filter:a", ",".join(filters),
-                        "-acodec", "pcm_f32le", "-ar", str(SAMPLE_RATE),
-                        normalized_wav]
-            ffmpeg_utils.run_ffmpeg(norm_cmd, work_duration, "Normalizing")
-            processed_wav = normalized_wav
-            if args.normalize:
-                # loudnorm silently switches between linear and dynamic modes
-                # depending on available headroom, so the only trustworthy figure
-                # is one measured off the result.
-                achieved = ffmpeg_utils.measure_loudness(
-                    processed_wav, args.target_lufs, args.target_tp, args.target_lra,
-                    work_duration, label="Verifying loudness")
-                actual = None
-                if achieved:
-                    try:
-                        actual = float(achieved["input_i"])
-                    except (KeyError, TypeError, ValueError):
-                        actual = None
-                if actual is None:
-                    print_success("Loudness normalised.")
-                else:
-                    print_success(f"Loudness normalised: {actual:.1f} LUFS "
-                                  f"(target {args.target_lufs:g}).")
-                    if abs(actual - args.target_lufs) > args.loudness_tolerance_db:
-                        print_warning(
-                            f"That is {abs(actual - args.target_lufs):.1f} dB off the target. "
-                            f"loudnorm caps its gain to keep the true peak under "
-                            f"{args.target_tp:g} dBTP, so quiet, peaky source material lands short. "
-                            f"Use --audio_gain for a limited extra boost if you need it louder."
-                        )
-            else:
-                print_success("Gain applied and limited.")
-
-        # -- Mix the music bed back under the speech ------------------------
-        if mix_music:
-            steps.start("Mixing music bed back under the cleaned speech")
-            level = args.music_level_db
-            filter_complex = (
-                f"[1:a]volume={level:g}dB[music];"
-                f"[0:a][music]amix=inputs=2:duration=first:normalize=0[mixed];"
-                f"[mixed]{ffmpeg_utils.compensated(limiter(args.limiter_ceiling), SAMPLE_RATE)}[out]"
-            )
-            mix_cmd = ["ffmpeg", "-y", "-i", processed_wav, "-i", music_wav,
-                       "-filter_complex", filter_complex, "-map", "[out]",
-                       "-acodec", "pcm_f32le", "-ar", str(SAMPLE_RATE), mixed_wav]
-            ffmpeg_utils.run_ffmpeg(mix_cmd, work_duration, "Mixing")
-            processed_wav = mixed_wav
-            print_success(f"Music mixed back at {level:g} dB.")
-        elif args.separate_music:
-            print_info("Music dropped entirely (--music_level_db off).")
-
-        # -- Mechanical tick/click reduction --------------------------------
-        # Runs last, on the normalised signal: afftdn's noise floor (nf) is an
-        # absolute level, so it must see the levels it was tuned against.
-        if args.declick:
-            steps.start("Reducing mechanical tick/click noise")
-            declick_cmd = ["ffmpeg", "-y", "-i", processed_wav,
-                           "-filter:a",
-                           ffmpeg_utils.compensated(
-                               f"afftdn=nr={args.declick_nr:g}:nf={args.declick_nf:g}",
-                               SAMPLE_RATE),
-                           "-acodec", "pcm_f32le", "-ar", str(SAMPLE_RATE),
-                           declicked_wav]
-            ffmpeg_utils.run_ffmpeg(declick_cmd, work_duration, "Declicking")
-            processed_wav = declicked_wav
-            print_success(f"Click reduction applied (nr={args.declick_nr:g} dB).")
+            steps.start("Rendering: " + " → ".join(render_stages))
+            result = postprocess.render(
+                graph_opts, denoised_wav,
+                music_wav if graph_opts.music_level_db is not None else None,
+                final_wav, work_duration,
+                label="Rendering " + "→".join(render_stages))
+            _report_render(graph_opts, result, args)
+            processed_wav = final_wav
 
         # -- Final output ---------------------------------------------------
         if compare_mode:
@@ -739,6 +719,7 @@ def _merge_video(input_path, processed_wav, output_path, actual_start,
 def main():
     procs.install_signal_handlers()
     args = build_parser().parse_args()
+    ffmpeg_utils.VERBOSE = args.verbose
     try:
         _run(args)
     except KeyboardInterrupt:

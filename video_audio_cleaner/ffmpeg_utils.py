@@ -9,6 +9,10 @@ from . import procs
 from .console import print_info
 from .progress import ProgressReporter
 
+# Print each ffmpeg command line before running it (--verbose). Off by default:
+# a single render graph is several hundred characters and drowns the progress.
+VERBOSE = False
+
 
 def _run_capture(cmd, timeout=120):
     """Run a short-lived command and capture its output as text."""
@@ -103,10 +107,22 @@ def probe_keyframe_at_or_before(path, start_sec, lookbacks=(15.0, 60.0, 240.0)):
     return None
 
 
+def format_speed(raw):
+    """ffmpeg's speed field ('31.7x', '1.68e+03x', 'N/A') as 'N sec/sec', or None."""
+    raw = raw.strip()
+    if not raw.endswith("x"):
+        return None
+    try:
+        value = float(raw[:-1])
+    except ValueError:
+        return None
+    return f"{value:.0f} sec/sec" if value >= 100 else f"{value:.1f} sec/sec"
+
+
 def run_ffmpeg(cmd_args, duration, prefix, quiet=False):
     """Run ffmpeg, rendering the shared progress bar. Returns captured stderr."""
     cmd = list(cmd_args) + ["-progress", "-", "-nostats"]
-    if not quiet:
+    if VERBOSE and not quiet:
         print_info(f"Running command: {shlex.join(cmd)}")
 
     reporter = ProgressReporter(prefix, duration)
@@ -126,11 +142,7 @@ def run_ffmpeg(cmd_args, duration, prefix, quiet=False):
                 except ValueError:
                     pass
             elif line.startswith("speed="):
-                raw_speed = line.split("=", 1)[1].strip()
-                if raw_speed.endswith("x"):
-                    speed = f"{raw_speed[:-1]} sec/sec"
-                elif raw_speed and raw_speed != "N/A":
-                    speed = raw_speed
+                speed = format_speed(line.split("=", 1)[1]) or speed
         proc.wait()
         stderr_file.seek(0)
         stderr_text = stderr_file.read()
@@ -166,13 +178,8 @@ def _finite(value):
     return num == num and abs(num) != float("inf")
 
 
-def measure_loudness(path, target_lufs, target_tp, target_lra, duration=None,
-                     label="Analyzing loudness"):
-    """First loudnorm pass: measure the file. Returns the stats dict or None."""
-    filt = (f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
-            f":print_format=json")
-    cmd = ["ffmpeg", "-y", "-i", path, "-af", filt, "-f", "null", "-"]
-    stderr_text = run_ffmpeg(cmd, duration, label)
+def loudnorm_stats(stderr_text):
+    """Validated loudnorm measurement from an analysis run's stderr, or None."""
     stats = _parse_loudnorm_json(stderr_text)
     if not stats:
         return None
@@ -183,19 +190,6 @@ def measure_loudness(path, target_lufs, target_tp, target_lra, duration=None,
     return stats
 
 
-def loudnorm_filter(target_lufs, target_tp, target_lra, measured=None):
-    base = f"loudnorm=I={target_lufs}:TP={target_tp}:LRA={target_lra}"
-    if not measured:
-        return base
-    return (f"{base}"
-            f":measured_I={measured['input_i']}"
-            f":measured_TP={measured['input_tp']}"
-            f":measured_LRA={measured['input_lra']}"
-            f":measured_thresh={measured['input_thresh']}"
-            f":offset={measured['target_offset']}"
-            f":linear=true")
-
-
 # --------------------------------------------------------------------------
 # Latency compensation
 # --------------------------------------------------------------------------
@@ -204,7 +198,7 @@ def loudnorm_filter(target_lufs, target_tp, target_lra, measured=None):
 # ffmpeg 8.1: afftdn 1200, anlmdn patch+search, alimiter 239 at 48 kHz). The
 # merge copies video untouched, so any shift becomes lip-sync error. The delay
 # depends on filter parameters and ffmpeg version, so it is measured with an
-# impulse rather than hard-coded.
+# impulse rather than hard-coded; graph.py removes it in place.
 _latency_cache = {}
 
 
@@ -236,18 +230,3 @@ def filter_latency(chain, sample_rate):
         latency = 0  # the impulse did not survive; assume no shift rather than guess
     _latency_cache[key] = latency
     return latency
-
-
-def compensated(chain, sample_rate, measure_chain=None):
-    """`chain` wrapped so its output lines up with its input, length unchanged.
-
-    The input tail is padded by the latency before filtering, so the filter
-    flushes the real end of the audio, then the same amount is trimmed off the
-    front. `measure_chain` lets callers measure a variant of the chain that has
-    no runtime commands (asendcmd) attached.
-    """
-    latency = filter_latency(measure_chain or chain, sample_rate)
-    if latency == 0:
-        return chain
-    return (f"apad=pad_len={latency},{chain},"
-            f"atrim=start_sample={latency},asetpts=PTS-STARTPTS")

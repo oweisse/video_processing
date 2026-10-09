@@ -10,21 +10,14 @@ Two methods:
   reduction works. This is what avoids the "musical noise" warble, because the
   filter is no longer guessing what the noise looks like.
 
-The profile method prepends the noise sample to the audio and uses ``asendcmd``
-to tell ``afftdn`` to measure during it, then trims the sample back off. ffmpeg
-processes linearly, so the sample has to come first.
-
-Both filters delay their output (afftdn by half its analysis window, anlmdn by
-patch + search); ``ffmpeg_utils.compensated`` removes that shift so the audio
-stays in sync with the untouched video.
+The filters themselves run inside the single render graph (graph.py); this
+module only decides where profile mode takes its noise sample.
 """
-import os
 from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
 
-from . import ffmpeg_utils
 from .console import print_info, print_warning
 
 
@@ -63,76 +56,19 @@ def find_quietest_region(path, length_sec):
     return NoiseSample(best * 0.1, float(20 * np.log10(smoothed[best])) - floor_db)
 
 
-def reduce_hiss_patch(input_wav, output_wav, strength, window, duration=None,
-                      sample_rate=48000, prefix="Reducing hiss"):
-    chain = ffmpeg_utils.compensated(
-        f"anlmdn=s={strength:g}:p=0.002:r={window:g}", sample_rate)
-    cmd = ["ffmpeg", "-y", "-i", input_wav, "-filter:a", chain,
-           "-acodec", "pcm_f32le", output_wav]
-    ffmpeg_utils.run_ffmpeg(cmd, duration, prefix)
-
-
-def reduce_hiss_profile(input_wav, output_wav, temp_dir, noise_reduction,
-                        gain_smooth, noise_floor=-40.0, noise_at=None,
-                        noise_len=1.0, max_excess_db=6.0, duration=None,
-                        sample_rate=48000, prefix="Reducing hiss"):
-    """Sample a speech-free stretch, then subtract that measured noise shape.
-
-    Returns the NoiseSample that was used.
-    """
-    if noise_at is None:
-        sample = find_quietest_region(input_wav, noise_len)
-        print_info(f"Noise profile sampled from the quietest {noise_len:g}s "
-                   f"at {sample.start:.2f}s into the window "
-                   f"({sample.excess_db:+.1f} dB vs the noise floor).")
-        if sample.likely_contains_speech(max_excess_db):
-            print_warning(
-                f"No clear pause found: the quietest {noise_len:g}s sits "
-                f"{sample.excess_db:.1f} dB above the window's noise floor, so the "
-                f"'noise' sample probably contains speech and profile mode will remove "
-                f"some of it. Point --noise_profile_at at a pause, or use "
-                f"--hiss_method patch.")
-    else:
-        sample = NoiseSample(float(noise_at), float("nan"))
-        print_info(f"Noise profile sampled at {sample.start:.2f}s (as requested).")
-
-    noise_wav = os.path.join(temp_dir, "profile_noise.wav")
-    joined_wav = os.path.join(temp_dir, "profile_joined.wav")
-    filtered_wav = os.path.join(temp_dir, "profile_filtered.wav")
-
-    ffmpeg_utils.run_ffmpeg(
-        ["ffmpeg", "-y", "-ss", f"{sample.start:.3f}", "-t", f"{noise_len:g}",
-         "-i", input_wav, "-acodec", "pcm_f32le", noise_wav],
-        noise_len, "Sampling noise", quiet=True)
-
-    padded = (duration + noise_len) if duration else None
-    ffmpeg_utils.run_ffmpeg(
-        ["ffmpeg", "-y", "-i", noise_wav, "-i", input_wav,
-         "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[o]", "-map", "[o]",
-         "-acodec", "pcm_f32le", joined_wav],
-        padded, "Preparing", quiet=True)
-
-    # Measure across the prepended sample, stopping just short of its end.
-    sample_end = max(0.05, noise_len - 0.1)
-    denoiser = f"afftdn=nr={noise_reduction:g}:nf={noise_floor:g}:gs={gain_smooth:g}"
-    chain = ffmpeg_utils.compensated(
-        f"asendcmd=c='0.0 afftdn sn start; {sample_end:g} afftdn sn stop',{denoiser}",
-        sample_rate, measure_chain=denoiser)
-    ffmpeg_utils.run_ffmpeg(
-        ["ffmpeg", "-y", "-i", joined_wav, "-filter:a", chain,
-         "-acodec", "pcm_f32le", filtered_wav],
-        padded, prefix)
-
-    # Drop the sample we prepended.
-    ffmpeg_utils.run_ffmpeg(
-        ["ffmpeg", "-y", "-i", filtered_wav,
-         "-af", f"atrim=start_sample={int(round(noise_len * sample_rate))},asetpts=PTS-STARTPTS",
-         "-acodec", "pcm_f32le", output_wav],
-        duration, "Trimming", quiet=True)
-
-    if duration:
-        produced = ffmpeg_utils.probe_duration(output_wav)
-        if produced and abs(produced - duration) > 0.25:
-            print_warning(f"Hiss stage produced {produced:.2f}s where "
-                          f"{duration:.2f}s was expected.")
-    return sample
+def choose_noise_sample(denoised_wav, noise_at, noise_len, max_excess_db):
+    """Where profile mode samples its noise: the user's time, or the quietest stretch."""
+    if noise_at is not None:
+        print_info(f"Noise profile sampled at {noise_at:.2f}s (as requested).")
+        return float(noise_at)
+    sample = find_quietest_region(denoised_wav, noise_len)
+    print_info(f"Noise profile sampled from the quietest {noise_len:g}s at "
+               f"{sample.start:.2f}s into the window "
+               f"({sample.excess_db:+.1f} dB vs the noise floor).")
+    if sample.likely_contains_speech(max_excess_db):
+        print_warning(
+            f"No clear pause found: the quietest {noise_len:g}s sits "
+            f"{sample.excess_db:.1f} dB above the window's noise floor, so the 'noise' "
+            f"sample probably contains speech and profile mode will remove some of it. "
+            f"Point --noise_profile_at at a pause, or use --hiss_method patch.")
+    return sample.start

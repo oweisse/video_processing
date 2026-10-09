@@ -67,14 +67,17 @@ def test_crossfade_not_worse_than_hard_joins(fx, tmp_path):
 
 
 def test_profile_hiss_removes_more_than_patch(fx, denoised, tmp_path):
-    from video_audio_cleaner import hiss
-    base = str(denoised[10.0])
+    from tests.render_helper import render
+    base = denoised[10.0]
     prof, patch = tmp_path / "prof.wav", tmp_path / "patch.wav"
-    quiet(hiss.reduce_hiss_profile, base, str(prof), str(tmp_path), 12.0, 0.0, duration=60.0)
-    quiet(hiss.reduce_hiss_patch, base, str(patch), 0.0003, 0.0025, duration=60.0)
-    p, sr = M.load_mono(prof)
+    render(base, prof, 60.0, hiss_method="profile")
+    render(base, patch, 60.0, hiss_method="patch")
+    clean, sr = M.load_mono(fx.clean_speech)
+    p, _ = M.load_mono(prof)
     q, _ = M.load_mono(patch)
     assert M.speech_to_hiss_db(p, sr) > M.speech_to_hiss_db(q, sr) + 5
+    # With latency compensated, profile mode must not damage the speech.
+    assert M.speech_fidelity(clean, p, sr) > 0.85
 
 
 @pytest.mark.demucs
