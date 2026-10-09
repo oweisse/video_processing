@@ -142,7 +142,7 @@ command is always printed with its error.
 | `--hiss_nf` | `-40` | Noise floor for `profile` mode, in dB (−80 to −20). |
 | `--hiss_gain_smooth` | `0` | Raise (0–50) if `profile` mode still warbles. |
 | `--hiss_strength` | `0.0003` | Strength for `patch` mode. |
-| `--hiss_window` | `0.0025` | Patch search window, seconds. Larger = echo-like smearing. |
+| `--hiss_window` | `0.0025` | Patch search window, seconds. Larger removes more hiss, with more warble. |
 | `--declick` | off | Extra pass to reduce mechanical tick/click noise. See below. |
 | `--declick_nr` | `12` | Declick strength in dB (0.01–97). |
 | `--declick_nf` | `-28` | Declick noise floor in dB (−80 to −20). |
@@ -183,7 +183,7 @@ main cause of the hollow, "underwater" sound on voices.
 
 - `20` (the default) removes most of the noise while keeping voices natural.
 - Quiet or distant speech → **lower** it to `10`. On a quiet passage of real home video,
-  10 kept speech fidelity at 0.98 where 30 dropped it to 0.84.
+  10 kept speech fidelity at 0.99 where 30 dropped it to 0.84.
 - Genuinely noisy material with strong voices → raise it to `30`, or pass `none`.
 
 ### Steady background hiss: `--reduce_hiss`
@@ -192,18 +192,22 @@ For tape/film hiss that survives DeepFilterNet. It runs immediately after denois
 *before* normalisation, so it sees the recording's own noise floor rather than one already
 boosted by tens of dB.
 
-The instinct is to raise `--atten_lim_db` instead. Don't — measured on a quiet passage
-(speech/hiss ratio, higher is cleaner; speech fidelity, 1.0 = untouched):
+The instinct is to raise `--atten_lim_db` instead. Don't — measured on a quiet passage of
+home video (speech fidelity: 1.0 = speech structure untouched; speech-to-hiss: higher is
+cleaner; warble: musical-noise flicker, 5.6 is the untouched recording):
 
-| Setting | Speech fidelity | Speech-to-hiss |
-|---|---|---|
-| Source | 1.000 | 13.3 dB |
-| atten 10 | 0.980 | 12.7 dB |
-| atten 30 | 0.841 | 11.1 dB |
-| **atten 10 + `--reduce_hiss`** | **0.860** | **19.2 dB** |
+| Setting | Speech fidelity | Speech-to-hiss | Warble |
+|---|---|---|---|
+| Source | 1.000 | 13.3 dB | 5.6 |
+| atten 10 | 0.993 | 13.0 dB | 5.6 |
+| atten 30 | 0.843 | 10.7 dB | 5.6 |
+| **atten 10 + `--reduce_hiss`** | **0.971** | **19.6 dB** | **5.6** |
+
+*Regenerate with:* `./venv/bin/python scripts/readme_numbers.py SPEECH_VIDEO TICK_VIDEO`
 
 Raising attenuation to 30 costs a lot of speech and leaves the hiss *worse* than the
-source. `--reduce_hiss` costs about the same fidelity and actually removes the hiss.
+source. `--reduce_hiss` removes 6.6 dB of hiss for a small fraction of that cost, and
+adds no warble.
 
 #### `profile` mode (default)
 
@@ -214,39 +218,41 @@ guessing at a generic noise floor. Knowing what the noise actually looks like is
 avoids the warbling.
 
 Override the sample point with `--noise_profile_at 12s` if the automatic pick lands on
-speech; turn strength up with `--hiss_nr 20`.
+speech; turn strength up with `--hiss_nr 20`. The tool warns when the chosen second does
+not look like a pause.
 
-Measured on a quiet passage, profile mode beats the patch method on **both** axes:
+The two methods trade off differently on the same passage (atten 10):
 
-| Method | Speech-to-hiss | Warble (5.6 = untouched) |
-|---|---|---|
-| No hiss stage | 12.7 dB | 5.6 |
-| `patch` | 17.7 dB | 6.5 |
-| **`profile` (default)** | **22.0 dB** | **6.1** |
+| Method | Speech fidelity | Speech-to-hiss | Warble |
+|---|---|---|---|
+| No hiss stage | 0.993 | 13.0 dB | 5.6 |
+| `patch` | 0.986 | 16.8 dB | 6.4 |
+| **`profile` (default)** | 0.971 | **19.6 dB** | **5.6** |
+
+*Regenerate with:* `./venv/bin/python scripts/readme_numbers.py SPEECH_VIDEO TICK_VIDEO`
+
+Profile mode removes the most hiss and adds no warble at all; patch mode touches the
+speech slightly less. If voices sound thinner with profile mode, try `--hiss_method patch`.
 
 #### `patch` mode
 
-**If you hear warbling ("pets pets pets") or an echo** in `patch` mode, those are its two
-artifacts, and they have different causes:
-
-- *Echo / smearing* comes from `--hiss_window`. The filter averages similar patches found
-  within that window, so a wide one literally smears audio across time. The default is
-  deliberately tight (0.0025 s).
-- *Warbling* comes from `--hiss_strength` — isolated frequency bins surviving as short
-  tonal bursts. It scales with how much hiss you remove; there is no setting that removes
-  a lot of hiss with none of it.
-
-Tightening the window is close to free — same hiss removal, much better speech:
+*Warbling* ("pets pets pets") comes from `--hiss_strength`: isolated frequency bins
+surviving as short tonal bursts. It scales with how much hiss you remove; patch mode has
+no setting that removes a lot of hiss with none of it.
 
 | Setting | Speech fidelity | Speech-to-hiss | Warble |
 |---|---|---|---|
-| No hiss stage | 0.980 | 12.7 dB | 5.6 |
-| strength 0.0003, window 0.006 | 0.860 | 19.2 dB | 6.8 |
-| **strength 0.0003, window 0.0025** | **0.926** | 16.7 dB | 6.3 |
-| **strength 0.0006, window 0.0025** | **0.921** | 19.4 dB | 6.8 |
+| No hiss stage | 0.993 | 13.0 dB | 5.6 |
+| strength 0.0003, window 0.006 | 0.985 | 19.3 dB | 6.8 |
+| **strength 0.0003, window 0.0025 (default)** | 0.986 | 16.8 dB | 6.4 |
+| strength 0.0006, window 0.0025 | 0.977 | 19.6 dB | 6.8 |
 
-At the tight window, `0.0006` matches the wide window's hiss removal with far less damage.
-Raise `--hiss_strength` toward `0.001` for more, and accept more warble.
+*Regenerate with:* `./venv/bin/python scripts/readme_numbers.py SPEECH_VIDEO TICK_VIDEO`
+
+A wider `--hiss_window` removes more hiss at the same fidelity, with more warble. An
+earlier version of this README blamed the wide window for an *echo*. That echo was
+the filter's look-ahead delay — 8 ms at window 0.006 — which is now removed for every
+setting (see *Audio/video sync*).
 
 A lowpass filter is *not* a substitute — it removes hiss and speech harmonics in equal
 measure, leaving the ratio unchanged (13.1 dB at 8 kHz, versus 13.3 untouched).
@@ -256,16 +262,19 @@ measure, leaving the ratio unchanged (13.1 dB at 8 kHz, versus 13.3 untouched).
 Film-transfer footage often carries the projector or camera mechanism as a rapid
 "tick tick" — a broadband click train of roughly 20–25 clicks per second.
 DeepFilterNet is trained on *stationary* noise (hiss, hum, fans) and only removes about
-half of these. `--declick` adds a spectral pass afterwards that takes out roughly a fifth
+half of these. `--declick` adds a spectral pass afterwards that takes out about a third
 of what remains.
 
 Measured on real Super-8 transfer footage:
 
-| | clicks/sec | vs source |
+| Setting | Clicks/sec | vs source |
 |---|---|---|
 | Source | 20.2 | 100% |
-| DeepFilterNet only | 10.2 | 51% |
-| **plus `--declick`** | **9.3** | **46%** |
+| DeepFilterNet (atten 30) | 10.4 | 51% |
+| **+ `--declick`** | **7.0** | **35%** |
+| atten `none` instead | 10.2 | 51% |
+
+*Regenerate with:* `./venv/bin/python scripts/readme_numbers.py SPEECH_VIDEO TICK_VIDEO`
 
 The default strength is `--declick_nr 12`; it used to be 24, which caused a pumping, echo-like artifact on the first real recording it met.
 
@@ -288,8 +297,8 @@ kept on the `level-guard-experiment` branch.
 Set expectations accordingly: this reduces the ticking, it does not eliminate it. Two
 things that do **not** help, both measured rather than assumed:
 
-- **`--atten_lim_db none`** removes no additional clicks and costs 12 dB of speech-band
-  energy. Leave the attenuation at `30`.
+- **`--atten_lim_db none`** removes no additional clicks (10.2/sec vs 10.4) and, as the
+  hiss table shows, unlimited attenuation is what damages speech. Keep it at 20–30.
 - **`--music_level_db off`** does not help either. The clicks stay in the Demucs *vocals*
   stem, not the music bed, so dropping the music leaves them behind.
 
@@ -301,7 +310,8 @@ scan reading the magnetic stripe directly avoids it at the source.
 ### A note on `--normalize` and loudness
 
 The tool reports the loudness it actually measured on the result, e.g.
-`Loudness normalised: -16.0 LUFS (target -16)`. `loudnorm` caps its own gain to keep the
+`Final audio: -16.1 LUFS, true peak -5.6 dBTP (target -16)`, measured at the end of
+the render — after the music bed and declick, on the audio you get. `loudnorm` caps its own gain to keep the
 true peak under −1.5 dBTP, so quiet, peaky material can land short of the target — the
 tool warns when it is more than 2 dB off. That behaviour is deliberate: staying below the
 peak ceiling matters more than hitting a loudness number. Use `--audio_gain` if you need

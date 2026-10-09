@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-audio-cleaner"
-version = "0.2.0"
+version = "0.3.0"
 description = "Extract, denoise, and re-merge speech audio in videos (DeepFilterNet + optional Demucs)"
 readme = "README.md"
 # DeepFilterLib 0.5.6 (DeepFilterNet's Rust core) ships macOS wheels only for

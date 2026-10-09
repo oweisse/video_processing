@@ -3,8 +3,9 @@
 Two methods:
 
 * ``patch`` — ffmpeg's ``anlmdn``, a time-domain non-local-means smoother. It
-  needs no noise sample, but averaging similar patches across time smears the
-  audio slightly (heard as echo) and leaves some warbling.
+  needs no noise sample and touches speech slightly less, but leaves some
+  warbling. (An "echo" once blamed on its search window was its look-ahead
+  delay, now removed in graph.py.)
 * ``profile`` — learn this recording's own noise fingerprint from a speech-free
   stretch and subtract that specific shape, the way Audacity's noise-profile
   reduction works. This is what avoids the "musical noise" warble, because the

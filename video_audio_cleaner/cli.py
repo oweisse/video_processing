@@ -121,7 +121,8 @@ def build_parser():
                              "recording's own noise fingerprint from a speech-free stretch "
                              "and subtracts it — the Audacity approach, and free of the "
                              "warbling 'musical noise'. 'patch' uses a time-domain "
-                             "smoother that needs no sample but smears slightly.")
+                             "smoother that needs no sample and touches speech slightly "
+                             "less, but leaves some warble.")
     parser.add_argument("--noise_profile_at", type=parse_time_string, default=None,
                         metavar="TIME",
                         help="Where to sample the noise for 'profile' mode, measured from "
@@ -148,7 +149,7 @@ def build_parser():
                              "noticeably more; past ~0.001 you start to hear warbling.")
     parser.add_argument("--hiss_window", type=float, default=0.0025,
                         help="Patch search window for 'patch' mode, in seconds (default: "
-                             "0.0025). This is what causes echo-like smearing.")
+                             "0.0025). Wider removes more hiss, with more warble.")
 
     parser.add_argument("--declick", action="store_true",
                         help="Extra spectral pass to reduce mechanical tick/click noise "
