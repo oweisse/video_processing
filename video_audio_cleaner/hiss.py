@@ -16,9 +16,9 @@ module only decides where profile mode takes its noise sample.
 from dataclasses import dataclass
 
 import numpy as np
-import soundfile as sf
 
 from .console import print_info, print_warning
+from .levels import frame_levels
 
 
 @dataclass
@@ -39,21 +39,22 @@ class NoiseSample:
 
 
 def find_quietest_region(path, length_sec):
-    """The quietest `length_sec` stretch — our best guess at pure noise."""
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    mono = data.mean(axis=1)
-    win = max(1, int(0.1 * sr))
-    count = len(mono) // win
-    if count < 2:
+    """The quietest `length_sec` stretch — our best guess at pure noise.
+
+    Streams the file (levels.frame_levels), so long windows are never loaded
+    whole.
+    """
+    lv = frame_levels(path)
+    rms = lv.rms
+    if len(rms) < 2:
         return NoiseSample(0.0, 0.0)
-    rms = np.sqrt(np.mean(mono[:count * win].reshape(count, win) ** 2, axis=1)) + 1e-12
-    floor_db = float(np.percentile(20 * np.log10(rms), 10))
-    span = max(1, int(round(length_sec / 0.1)))
-    if span >= count:
+    floor_db = lv.floor_db
+    span = max(1, int(round(length_sec / lv.frame_sec)))
+    if span >= len(rms):
         return NoiseSample(0.0, float(20 * np.log10(np.mean(rms))) - floor_db)
     smoothed = np.convolve(rms, np.ones(span) / span, mode="valid")
     best = int(np.argmin(smoothed))
-    return NoiseSample(best * 0.1, float(20 * np.log10(smoothed[best])) - floor_db)
+    return NoiseSample(best * lv.frame_sec, float(20 * np.log10(smoothed[best])) - floor_db)
 
 
 def choose_noise_sample(denoised_wav, noise_at, noise_len, max_excess_db):

@@ -269,12 +269,21 @@ Measured on real Super-8 transfer footage:
 
 The default strength is `--declick_nr 12`; it used to be 24, which caused a pumping, echo-like artifact on the first real recording it met.
 
-**Only use it on loud, well-levelled passages.** On quiet material it is actively
-destructive: measured on a quiet stretch it removed *no* clicks (17.8 → 18.5/sec) while
-dropping speech fidelity from 0.935 to 0.655. After a big normalisation boost the filter
-can no longer tell speech from noise and eats both. Lowering `--declick_nf` does not
-rescue it (it gets worse), and neither does `--declick_nr`. If a passage sounds hollow or
-hard to follow, drop `--declick` first.
+**On quiet passages it does little — but no longer harms.** Earlier versions measured a
+collapse in speech fidelity (0.935 → 0.655) on a quiet stretch. That turned out to be the
+filter's uncompensated 25 ms delay, not the declicking itself (see *Audio/video sync*).
+With the delay removed, the same stretch costs 0.013 fidelity (0.952 → 0.939). It also
+removes almost no clicks there, because after a large normalisation boost the filter
+cannot separate the ticks from the noise. So on quiet material `--declick` is harmless
+but mostly pointless.
+
+**Why there is no per-passage strength.** The obvious fix — lighter processing on quiet
+passages, full strength on loud ones — was built and measured, and made things worse. On
+quiet speech, processing mostly removes *noise*, so switching strength moves the noise
+floor by up to 15 dB: audible pumping (fidelity 0.930 → 0.657 on the quiet passage). It
+also turned out that ffmpeg's runtime controls corrupt `afftdn`: toggling it with
+`enable=`, or changing its strength mid-stream, scrambles its state. The experiment is
+kept on the `level-guard-experiment` branch.
 
 Set expectations accordingly: this reduces the ticking, it does not eliminate it. Two
 things that do **not** help, both measured rather than assumed:

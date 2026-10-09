@@ -62,3 +62,19 @@ def test_noise_profile_at_out_of_range_fails_fast(fx, tmp_path):
     assert out.returncode == 1
     assert "leaves no room" in out.stderr
     assert "between 0 and 4.00s" in out.stderr
+
+
+def test_levels_stream_long_files_in_blocks(tmp_path, monkeypatch):
+    """frame_levels must not read the whole file at once."""
+    import soundfile
+
+    from video_audio_cleaner import levels
+    x = np.random.default_rng(5).standard_normal(130 * SR).astype(np.float32) * 0.01
+    path = _write(tmp_path, x)
+    read_whole = []
+    monkeypatch.setattr(soundfile, "read", lambda *a, **k: read_whole.append(1))
+    lv = levels.frame_levels(path)
+    assert not read_whole
+    assert len(lv.rms) == 1300
+    expected = np.sqrt(np.mean(x[:SR // 10] ** 2))
+    assert abs(lv.rms[0] - expected) < 1e-6
