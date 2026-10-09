@@ -18,9 +18,17 @@ from .console import print_error, print_info, print_step, print_success, print_w
 from .timeparse import format_time_filename, parse_time_string, positive_time
 
 SAMPLE_RATE = 48000
-TARGET_TP = -1.5
-TARGET_LRA = 11.0
-LIMITER = "alimiter=limit=0.97:level=false"
+# Defaults for the "Advanced thresholds" flags; stage logic reads the flags.
+DEFAULT_TARGET_TP = -1.5
+DEFAULT_TARGET_LRA = 11.0
+DEFAULT_LIMITER_CEILING = 0.97
+DEFAULT_SILENCE_WARN_LUFS = -45.0
+DEFAULT_LOUDNESS_TOLERANCE_DB = 2.0
+DEFAULT_SEPARATION_AUTO_SEGMENT_SEC = 600.0
+
+
+def limiter(ceiling):
+    return f"alimiter=limit={ceiling:g}:level=false"
 
 
 # --------------------------------------------------------------------------
@@ -87,10 +95,11 @@ def build_parser():
                              "of the window and write original+processed into one WAV "
                              "for A/B auditioning. Skips the video merge.")
 
-    parser.add_argument("--atten_lim_db", type=parse_atten_lim, default=30.0,
-                        help="Limit noise attenuation to this many dB (default: 30). "
-                             "Lower (e.g. 20) if voices sound hollow or processed; "
-                             "raise, or pass 'none', for maximum noise removal.")
+    parser.add_argument("--atten_lim_db", type=parse_atten_lim, default=20.0,
+                        help="Limit noise attenuation to this many dB (default: 20). "
+                             "Lower (e.g. 10) for quiet or distant speech, or if voices "
+                             "sound hollow; raise to 30, or pass 'none', for genuinely "
+                             "noisy material.")
     parser.add_argument("--chunk_len_sec", type=float, default=10.0,
                         help="Denoiser chunk length in seconds (default: 10).")
     parser.add_argument("--crossfade_sec", type=float, default=0.5,
@@ -130,6 +139,9 @@ def build_parser():
     parser.add_argument("--hiss_nr", type=float, default=12.0,
                         help="Strength for 'profile' mode in dB, 0.01-97 (default: 12). "
                              "Raise for more hiss removal.")
+    parser.add_argument("--hiss_nf", type=float, default=-40.0,
+                        help="Noise floor for 'profile' mode in dB, -80 to -20 "
+                             "(default: -40).")
     parser.add_argument("--hiss_gain_smooth", type=float, default=0.0,
                         help="Gain smoothing for 'profile' mode, 0-50 (default: 0). "
                              "Raise if you still hear warbling.")
@@ -145,8 +157,8 @@ def build_parser():
                              "(projector, camera motor, film transfer). Runs last, after "
                              "normalisation. Removes roughly a further 20%% of clicks that "
                              "DeepFilterNet leaves behind.")
-    parser.add_argument("--declick_nr", type=float, default=24.0,
-                        help="Declick strength in dB, 0.01-97 (default: 24). "
+    parser.add_argument("--declick_nr", type=float, default=12.0,
+                        help="Declick strength in dB, 0.01-97 (default: 12). "
                              "Raise for more reduction, lower if speech dulls.")
     parser.add_argument("--declick_nf", type=float, default=-28.0,
                         help="Declick noise floor in dB, -80 to -20 (default: -28).")
@@ -171,6 +183,29 @@ def build_parser():
                         help="x264 CRF used by --precise_cut (default: 18).")
     parser.add_argument("--audio_bitrate", type=str, default="192k",
                         help="AAC bitrate for the merged video (default: 192k).")
+
+    advanced = parser.add_argument_group(
+        "Advanced thresholds",
+        "Rarely needed. Every level and tolerance the pipeline uses is exposed here.")
+    advanced.add_argument("--target_tp", type=float, default=DEFAULT_TARGET_TP,
+                          help="True-peak ceiling for --normalize, dBTP (default: -1.5).")
+    advanced.add_argument("--target_lra", type=float, default=DEFAULT_TARGET_LRA,
+                          help="Loudness range target for --normalize, LU (default: 11).")
+    advanced.add_argument("--limiter_ceiling", type=float, default=DEFAULT_LIMITER_CEILING,
+                          help="Limiter ceiling after --audio_gain and the music mix, "
+                               "linear 0-1 (default: 0.97).")
+    advanced.add_argument("--silence_warn_lufs", type=float,
+                          default=DEFAULT_SILENCE_WARN_LUFS,
+                          help="Warn when the cleaned audio measures below this before "
+                               "normalising, LUFS (default: -45).")
+    advanced.add_argument("--loudness_tolerance_db", type=float,
+                          default=DEFAULT_LOUDNESS_TOLERANCE_DB,
+                          help="Warn when the result lands further than this from "
+                               "--target_lufs, dB (default: 2).")
+    advanced.add_argument("--separation_auto_segment_sec", type=float,
+                          default=DEFAULT_SEPARATION_AUTO_SEGMENT_SEC,
+                          help="Windows longer than this get a 7 s Demucs segment to "
+                               "bound memory, seconds (default: 600).")
 
     parser.add_argument("--keep_temp", type=str, default=None, metavar="DIR",
                         help="Copy intermediate WAVs into DIR for debugging.")
@@ -297,11 +332,12 @@ def _run(args):
     file_duration = ffmpeg_utils.probe_duration(input_path)
 
     compare_mode = args.compare is not None
-    wants_video = not args.filter_audio_only and not compare_mode
+    audio_only = args.filter_audio_only
+    wants_video = not audio_only and not compare_mode
     if wants_video and not ffmpeg_utils.has_video_stream(input_path):
         print_warning("Input has no video stream; writing a cleaned WAV instead.")
         wants_video = False
-        args.filter_audio_only = True
+        audio_only = True
 
     requested_start = args.skip_first_n_sec or 0.0
     requested_duration = args.process_n_seconds
@@ -342,7 +378,7 @@ def _run(args):
         has_window=(args.skip_first_n_sec is not None
                     or args.process_n_seconds is not None or compare_mode),
         compare_mode=compare_mode,
-        audio_only=args.filter_audio_only,
+        audio_only=audio_only,
     )
     output_path = os.path.join(output_dir, args.output or default_name)
 
@@ -429,7 +465,7 @@ def _run(args):
             from . import separation
 
             segment = args.separation_segment
-            if segment is None and work_duration and work_duration > 600:
+            if segment is None and work_duration and work_duration > args.separation_auto_segment_sec:
                 segment = 7.0  # htdemucs rejects segments longer than its training window
             separation.separate_to_files(
                 input_wav=raw_wav,
@@ -473,6 +509,7 @@ def _run(args):
                     temp_dir=temp_dir,
                     noise_reduction=args.hiss_nr,
                     gain_smooth=args.hiss_gain_smooth,
+                    noise_floor=args.hiss_nf,
                     noise_at=noise_at,
                     noise_len=args.noise_profile_len,
                     max_excess_db=args.noise_profile_max_excess_db,
@@ -499,13 +536,13 @@ def _run(args):
             filters = []
             if args.normalize:
                 measured = ffmpeg_utils.measure_loudness(
-                    processed_wav, args.target_lufs, TARGET_TP, TARGET_LRA, work_duration)
+                    processed_wav, args.target_lufs, args.target_tp, args.target_lra, work_duration)
                 if measured is None:
                     print_warning("Loudness measurement unusable (near-silent input?); "
                                   "falling back to single-pass loudnorm.")
                 else:
                     try:
-                        if float(measured["input_i"]) < -45.0:
+                        if float(measured["input_i"]) < args.silence_warn_lufs:
                             print_warning(
                                 f"Cleaned audio measures {float(measured['input_i']):.1f} LUFS, "
                                 f"which is close to silence. Normalising will apply a very "
@@ -515,13 +552,13 @@ def _run(args):
                     except (KeyError, TypeError, ValueError):
                         pass
                 filters.append(ffmpeg_utils.loudnorm_filter(
-                    args.target_lufs, TARGET_TP, TARGET_LRA, measured))
+                    args.target_lufs, args.target_tp, args.target_lra, measured))
                 # loudnorm works at 192 kHz internally; come back down before any
                 # sample-counted filter (the latency compensation counts samples).
                 filters.append(f"aresample={SAMPLE_RATE}")
             if args.audio_gain:
                 filters.append(f"volume={args.audio_gain}")
-                filters.append(ffmpeg_utils.compensated(LIMITER, SAMPLE_RATE))
+                filters.append(ffmpeg_utils.compensated(limiter(args.limiter_ceiling), SAMPLE_RATE))
 
             norm_cmd = ["ffmpeg", "-y", "-i", processed_wav,
                         "-filter:a", ",".join(filters),
@@ -534,7 +571,7 @@ def _run(args):
                 # depending on available headroom, so the only trustworthy figure
                 # is one measured off the result.
                 achieved = ffmpeg_utils.measure_loudness(
-                    processed_wav, args.target_lufs, TARGET_TP, TARGET_LRA,
+                    processed_wav, args.target_lufs, args.target_tp, args.target_lra,
                     work_duration, label="Verifying loudness")
                 actual = None
                 if achieved:
@@ -547,11 +584,11 @@ def _run(args):
                 else:
                     print_success(f"Loudness normalised: {actual:.1f} LUFS "
                                   f"(target {args.target_lufs:g}).")
-                    if abs(actual - args.target_lufs) > 2.0:
+                    if abs(actual - args.target_lufs) > args.loudness_tolerance_db:
                         print_warning(
                             f"That is {abs(actual - args.target_lufs):.1f} dB off the target. "
                             f"loudnorm caps its gain to keep the true peak under "
-                            f"{TARGET_TP:g} dBTP, so quiet, peaky source material lands short. "
+                            f"{args.target_tp:g} dBTP, so quiet, peaky source material lands short. "
                             f"Use --audio_gain for a limited extra boost if you need it louder."
                         )
             else:
@@ -564,7 +601,7 @@ def _run(args):
             filter_complex = (
                 f"[1:a]volume={level:g}dB[music];"
                 f"[0:a][music]amix=inputs=2:duration=first:normalize=0[mixed];"
-                f"[mixed]{ffmpeg_utils.compensated(LIMITER, SAMPLE_RATE)}[out]"
+                f"[mixed]{ffmpeg_utils.compensated(limiter(args.limiter_ceiling), SAMPLE_RATE)}[out]"
             )
             mix_cmd = ["ffmpeg", "-y", "-i", processed_wav, "-i", music_wav,
                        "-filter_complex", filter_complex, "-map", "[out]",
@@ -595,7 +632,7 @@ def _run(args):
         if compare_mode:
             steps.start("Building A/B comparison file")
             _write_compare(raw_wav, processed_wav, output_path, work_duration)
-        elif args.filter_audio_only:
+        elif audio_only:
             steps.start("Writing cleaned audio track")
             _write_wav_output(processed_wav, output_path, work_duration)
         else:

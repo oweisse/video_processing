@@ -87,7 +87,7 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--process_n_seconds` | to end | Process only this much (`3m30s`, `45s`). Must be > 0. |
 | `--filter_audio_only` | off | Write a 24-bit WAV instead of merging into video. |
 | `--compare [SECONDS]` | off (`20` if bare) | Preview mode — see below. |
-| `--atten_lim_db` | `30` | Cap noise attenuation, in dB. `none` = unlimited. |
+| `--atten_lim_db` | `20` | Cap noise attenuation, in dB. `none` = unlimited. |
 | `--chunk_len_sec` | `10` | Denoiser chunk length. |
 | `--crossfade_sec` | `0.5` | Crossfade between denoised chunks. |
 | `--normalize` | off | Two-pass loudness normalisation of the **cleaned** audio. |
@@ -99,11 +99,12 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--noise_profile_len` | `1` | Length of the noise sample, seconds. |
 | `--noise_profile_max_excess_db` | `6` | Warn when the auto-picked sample sits this far above the noise floor (likely speech). |
 | `--hiss_nr` | `12` | Strength for `profile` mode, in dB. |
+| `--hiss_nf` | `-40` | Noise floor for `profile` mode, in dB (−80 to −20). |
 | `--hiss_gain_smooth` | `0` | Raise (0–50) if `profile` mode still warbles. |
 | `--hiss_strength` | `0.0003` | Strength for `patch` mode. |
 | `--hiss_window` | `0.0025` | Patch search window, seconds. Larger = echo-like smearing. |
 | `--declick` | off | Extra pass to reduce mechanical tick/click noise. See below. |
-| `--declick_nr` | `24` | Declick strength in dB (0.01–97). |
+| `--declick_nr` | `12` | Declick strength in dB (0.01–97). |
 | `--declick_nf` | `-28` | Declick noise floor in dB (−80 to −20). |
 | `--separate_music` | off | Split speech from music with Demucs first. |
 | `--music_level_db` | `-12` | Level to mix music back under the speech. `off` drops it. |
@@ -113,6 +114,18 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--video_crf` | `18` | x264 quality for `--precise_cut`. |
 | `--audio_bitrate` | `192k` | AAC bitrate of the merged video. |
 | `--keep_temp DIR` | off | Copy intermediate WAVs to DIR for debugging. |
+
+**Advanced thresholds** — rarely needed; listed so nothing in the pipeline is a hidden
+constant:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target_tp` | `-1.5` | True-peak ceiling for `--normalize`, dBTP. |
+| `--target_lra` | `11` | Loudness range target for `--normalize`, LU. |
+| `--limiter_ceiling` | `0.97` | Limiter ceiling after `--audio_gain` and the music mix (linear). |
+| `--silence_warn_lufs` | `-45` | Warn when the cleaned audio is this quiet before normalising. |
+| `--loudness_tolerance_db` | `2` | Warn when the result lands this far from `--target_lufs`. |
+| `--separation_auto_segment_sec` | `600` | Longer windows get a 7 s Demucs segment to bound memory. |
 
 ### Time values
 
@@ -127,10 +140,10 @@ hours, e.g. `…_01h01m00s-01h01m20s.mp4`.
 This caps how much the denoiser is allowed to attenuate. Unlimited suppression is the
 main cause of the hollow, "underwater" sound on voices.
 
-- Voices sound processed or hollow → **lower** it (try `20`).
-- Too much noise remains → **raise** it (`40`), or pass `none`.
-- `30` (the default) removes nearly all the noise while keeping a trace of natural room
-  ambience.
+- `20` (the default) removes most of the noise while keeping voices natural.
+- Quiet or distant speech → **lower** it to `10`. On a quiet passage of real home video,
+  10 kept speech fidelity at 0.98 where 30 dropped it to 0.84.
+- Genuinely noisy material with strong voices → raise it to `30`, or pass `none`.
 
 ### Steady background hiss: `--reduce_hiss`
 
@@ -212,6 +225,8 @@ Measured on real Super-8 transfer footage:
 | Source | 20.2 | 100% |
 | DeepFilterNet only | 10.2 | 51% |
 | **plus `--declick`** | **9.3** | **46%** |
+
+The default strength is `--declick_nr 12`; it used to be 24, which caused a pumping, echo-like artifact on the first real recording it met.
 
 **Only use it on loud, well-levelled passages.** On quiet material it is actively
 destructive: measured on a quiet stretch it removed *no* clicks (17.8 → 18.5/sec) while

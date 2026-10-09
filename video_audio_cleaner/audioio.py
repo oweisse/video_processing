@@ -14,8 +14,3 @@ def write_wav(path, audio, sr):
         data = data[None, :]
     sf.write(str(path), data.T, int(sr), subtype="FLOAT")
 
-
-def read_wav(path):
-    """Read a WAV as a (channels, samples) float32 tensor."""
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    return torch.from_numpy(np.ascontiguousarray(data.T)), sr
