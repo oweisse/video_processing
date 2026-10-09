@@ -15,7 +15,7 @@ import tempfile
 
 from . import ffmpeg_utils, procs
 from .console import print_error, print_info, print_step, print_success, print_warning
-from .timeparse import format_time_filename, parse_time_string
+from .timeparse import format_time_filename, parse_time_string, positive_time
 
 SAMPLE_RATE = 48000
 TARGET_TP = -1.5
@@ -76,12 +76,12 @@ def build_parser():
 
     parser.add_argument("--skip_first_n_sec", type=parse_time_string, default=None,
                         help="Skip this much at the start (e.g. '8m50s', '90').")
-    parser.add_argument("--process_n_seconds", type=parse_time_string, default=None,
+    parser.add_argument("--process_n_seconds", type=positive_time, default=None,
                         help="Process only this much audio (e.g. '3m30s', '45s').")
 
     parser.add_argument("--filter_audio_only", action="store_true",
                         help="Write the cleaned WAV instead of merging back into video.")
-    parser.add_argument("--compare", type=float, nargs="?", const=20.0, default=None,
+    parser.add_argument("--compare", type=positive_time, nargs="?", const=20.0, default=None,
                         metavar="SECONDS",
                         help="Preview mode: process only the first SECONDS (default 20) "
                              "of the window and write original+processed into one WAV "
@@ -120,6 +120,13 @@ def build_parser():
                         help="Where to sample the noise for 'profile' mode, measured from "
                              "the start of the processed window (e.g. '12s'). Defaults to "
                              "the quietest second, found automatically.")
+    parser.add_argument("--noise_profile_len", type=positive_time, default=1.0,
+                        metavar="SECONDS",
+                        help="Length of the noise sample for 'profile' mode (default: 1).")
+    parser.add_argument("--noise_profile_max_excess_db", type=float, default=6.0,
+                        help="Warn when the automatically chosen noise sample sits more "
+                             "than this many dB above the window's quietest frames, i.e. "
+                             "probably contains speech (default: 6).")
     parser.add_argument("--hiss_nr", type=float, default=12.0,
                         help="Strength for 'profile' mode in dB, 0.01-97 (default: 12). "
                              "Raise for more hiss removal.")
@@ -196,12 +203,34 @@ def _validate_output_name(name):
     if name is None:
         return None
     separators = [os.sep] + ([os.altsep] if os.altsep else [])
+    if not name.strip() or name in (".", "..") or os.path.basename(name) != name:
+        raise RuntimeError(
+            f"-o/--output must be a plain file name, got '{name}'. "
+            "Pass the directory with --output_dir.")
     if any(sep in name for sep in separators):
         raise RuntimeError(
             "-o/--output is now a FILENAME placed inside --output_dir, not a path.\n"
             f"Got: '{name}'. Pass the directory with --output_dir instead."
         )
     return name
+
+
+def plan_window(requested_start, actual_start, requested_duration, file_duration):
+    """(snap_delta, actual_duration, work_duration) for the processed window.
+
+    actual_duration is what is cut from the input: the requested length plus the
+    keyframe snap, or everything to the end of the file. It is only None when the
+    file's duration is unknown. Always passing it to the merge as -t matters:
+    -shortest alone overshoots when video is stream-copied.
+    """
+    snap_delta = requested_start - actual_start
+    if requested_duration is not None:
+        actual_duration = requested_duration + snap_delta
+    elif file_duration is not None:
+        actual_duration = max(0.0, file_duration - actual_start)
+    else:
+        actual_duration = None
+    return snap_delta, actual_duration, actual_duration
 
 
 def derive_output_name(input_path, requested_start, requested_duration, file_duration,
@@ -302,17 +331,8 @@ def _run(args):
                 f"(use --precise_cut for an exact cut)."
             )
 
-    snap_delta = requested_start - actual_start
-    actual_duration = None
-    if requested_duration is not None:
-        actual_duration = requested_duration + snap_delta
-
-    if actual_duration is not None:
-        work_duration = actual_duration
-    elif file_duration is not None:
-        work_duration = max(0.0, file_duration - actual_start)
-    else:
-        work_duration = None
+    snap_delta, actual_duration, work_duration = plan_window(
+        requested_start, actual_start, requested_duration, file_duration)
 
     default_name = derive_output_name(
         input_path=input_path,
@@ -363,6 +383,18 @@ def _run(args):
         total_steps += 1
     total_steps += 1  # final output stage
     steps = _Steps(total_steps)
+
+    # --noise_profile_at is relative to the window the user asked for, but the
+    # extracted audio starts snap_delta earlier, at the keyframe.
+    noise_at = None
+    if args.reduce_hiss and args.hiss_method == "profile" and args.noise_profile_at is not None:
+        noise_at = args.noise_profile_at + snap_delta
+        if work_duration is not None and noise_at + args.noise_profile_len > work_duration:
+            latest = max(0.0, work_duration - snap_delta - args.noise_profile_len)
+            raise RuntimeError(
+                f"--noise_profile_at {args.noise_profile_at:g}s leaves no room for a "
+                f"{args.noise_profile_len:g}s sample inside the window; use a value "
+                f"between 0 and {latest:.2f}s.")
 
     temp_dir = tempfile.mkdtemp(prefix="video_audio_cleaner_")
     procs.register_path(temp_dir)
@@ -441,8 +473,11 @@ def _run(args):
                     temp_dir=temp_dir,
                     noise_reduction=args.hiss_nr,
                     gain_smooth=args.hiss_gain_smooth,
-                    noise_at=args.noise_profile_at,
+                    noise_at=noise_at,
+                    noise_len=args.noise_profile_len,
+                    max_excess_db=args.noise_profile_max_excess_db,
                     duration=work_duration,
+                    sample_rate=SAMPLE_RATE,
                 )
                 print_success(f"Hiss reduction applied "
                               f"(learned profile, nr={args.hiss_nr:g}).")
@@ -481,9 +516,12 @@ def _run(args):
                         pass
                 filters.append(ffmpeg_utils.loudnorm_filter(
                     args.target_lufs, TARGET_TP, TARGET_LRA, measured))
+                # loudnorm works at 192 kHz internally; come back down before any
+                # sample-counted filter (the latency compensation counts samples).
+                filters.append(f"aresample={SAMPLE_RATE}")
             if args.audio_gain:
                 filters.append(f"volume={args.audio_gain}")
-                filters.append(LIMITER)
+                filters.append(ffmpeg_utils.compensated(LIMITER, SAMPLE_RATE))
 
             norm_cmd = ["ffmpeg", "-y", "-i", processed_wav,
                         "-filter:a", ",".join(filters),
@@ -526,7 +564,7 @@ def _run(args):
             filter_complex = (
                 f"[1:a]volume={level:g}dB[music];"
                 f"[0:a][music]amix=inputs=2:duration=first:normalize=0[mixed];"
-                f"[mixed]{LIMITER}[out]"
+                f"[mixed]{ffmpeg_utils.compensated(LIMITER, SAMPLE_RATE)}[out]"
             )
             mix_cmd = ["ffmpeg", "-y", "-i", processed_wav, "-i", music_wav,
                        "-filter_complex", filter_complex, "-map", "[out]",
@@ -544,7 +582,9 @@ def _run(args):
             steps.start("Reducing mechanical tick/click noise")
             declick_cmd = ["ffmpeg", "-y", "-i", processed_wav,
                            "-filter:a",
-                           f"afftdn=nr={args.declick_nr:g}:nf={args.declick_nf:g}",
+                           ffmpeg_utils.compensated(
+                               f"afftdn=nr={args.declick_nr:g}:nf={args.declick_nf:g}",
+                               SAMPLE_RATE),
                            "-acodec", "pcm_f32le", "-ar", str(SAMPLE_RATE),
                            declicked_wav]
             ffmpeg_utils.run_ffmpeg(declick_cmd, work_duration, "Declicking")
@@ -571,10 +611,20 @@ def _run(args):
             print_success(f"A/B preview (original → 0.5s silence → processed):\n"
                           f"    {output_path}")
     finally:
-        if keep_temp_dir and os.path.isdir(temp_dir):
-            _copy_intermediates(temp_dir, keep_temp_dir)
-        procs.unregister_path(temp_dir)
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        _cleanup_temp(temp_dir, keep_temp_dir)
+
+
+def _cleanup_temp(temp_dir, keep_temp_dir=None):
+    """Stop every child first, then copy intermediates, then delete.
+
+    On an interrupt a child ffmpeg may still be writing here; copying or
+    deleting before it has exited would copy half-written files.
+    """
+    procs.terminate_all()
+    if keep_temp_dir and os.path.isdir(temp_dir):
+        _copy_intermediates(temp_dir, keep_temp_dir)
+    procs.unregister_path(temp_dir)
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _copy_intermediates(temp_dir, keep_temp_dir):
@@ -639,6 +689,9 @@ def _merge_video(input_path, processed_wav, output_path, actual_start,
     # of silent video; an explicit -t cuts both streams at the same point.
     if actual_duration is not None:
         cmd += ["-t", f"{actual_duration:.6f}"]
+    # No -avoid_negative_ts make_zero: it shifts every timestamp to absorb AAC's
+    # encoder priming, which starts the video 21 ms late. The mp4 muxer's edit
+    # list already handles the priming correctly.
     cmd += ["-shortest", partial]
 
     ffmpeg_utils.run_ffmpeg(cmd, work_duration, "Merging")

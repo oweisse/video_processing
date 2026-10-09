@@ -28,7 +28,8 @@ try:
         from df.io import load_audio
 
     HAS_DF_API = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError: a broken torch install (missing dylib) fails at import time too.
     pass
 
 SETUP_HINT = (

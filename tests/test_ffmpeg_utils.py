@@ -24,7 +24,6 @@ def test_parses_loudnorm_json():
     assert stats["input_i"] == "-31.92"
 
 
-@pytest.mark.xfail(strict=True, reason="takes the last {...}; anchored in Phase 2")
 def test_ignores_decoy_braces_after_loudnorm():
     stats = ffmpeg_utils._parse_loudnorm_json(LOUDNORM_STDERR + "\nmetadata {x=1}\n")
     assert stats is not None and stats["input_i"] == "-31.92"

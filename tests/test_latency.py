@@ -13,7 +13,6 @@ import soundfile as sf
 from video_audio_cleaner import hiss
 
 SR = 48000
-B6 = pytest.mark.xfail(strict=True, reason="B6: uncompensated filter latency, fixed in Phase 2")
 
 
 def impulse(path, at=1.0, total=3.0):
@@ -28,7 +27,6 @@ def peak_index(path):
     return int(np.argmax(np.abs(y.mean(axis=1))))
 
 
-@B6
 def test_patch_hiss_adds_no_delay(tmp_path):
     src, out = tmp_path / "i.wav", tmp_path / "o.wav"
     expected = impulse(src)
@@ -36,7 +34,6 @@ def test_patch_hiss_adds_no_delay(tmp_path):
     assert peak_index(out) == expected
 
 
-@B6
 def test_profile_hiss_adds_no_delay(tmp_path, fx):
     # The real speech fixture: profile mode needs a believable noise sample.
     src = fx.mix_noisy

@@ -147,15 +147,15 @@ def run_ffmpeg(cmd_args, duration, prefix, quiet=False):
 
 
 def _parse_loudnorm_json(stderr_text):
-    last = None
-    for match in re.finditer(r"\{[^{}]*\}", stderr_text, re.S):
-        last = match
-    if last is None:
-        return None
-    try:
-        return json.loads(last.group(0))
-    except json.JSONDecodeError:
-        return None
+    """The loudnorm stats block: the last {...} in stderr that holds input_i."""
+    for match in reversed(list(re.finditer(r"\{[^{}]*\}", stderr_text, re.S))):
+        if '"input_i"' not in match.group(0):
+            continue
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _finite(value):
@@ -194,3 +194,60 @@ def loudnorm_filter(target_lufs, target_tp, target_lra, measured=None):
             f":measured_thresh={measured['input_thresh']}"
             f":offset={measured['target_offset']}"
             f":linear=true")
+
+
+# --------------------------------------------------------------------------
+# Latency compensation
+# --------------------------------------------------------------------------
+# afftdn, anlmdn and alimiter all look ahead, and ffmpeg does not compensate:
+# their output is shifted later by a fixed number of samples (measured on
+# ffmpeg 8.1: afftdn 1200, anlmdn patch+search, alimiter 239 at 48 kHz). The
+# merge copies video untouched, so any shift becomes lip-sync error. The delay
+# depends on filter parameters and ffmpeg version, so it is measured with an
+# impulse rather than hard-coded.
+_latency_cache = {}
+
+
+def filter_latency(chain, sample_rate):
+    """Samples by which `chain` delays its input. Measured once per chain."""
+    key = (chain, sample_rate)
+    if key in _latency_cache:
+        return _latency_cache[key]
+
+    import numpy as np
+    import soundfile as sf
+
+    with tempfile.TemporaryDirectory(prefix="vac_latency_") as tmp:
+        src = f"{tmp}/impulse.wav"
+        dst = f"{tmp}/out.wav"
+        signal = np.zeros(3 * sample_rate, dtype=np.float32)
+        signal[sample_rate] = 0.5
+        sf.write(src, signal, sample_rate, subtype="FLOAT")
+        rc, _, err = _run_capture(
+            ["ffmpeg", "-y", "-v", "error", "-i", src, "-af", chain,
+             "-ac", "1", "-ar", str(sample_rate), "-acodec", "pcm_f32le", dst])
+        if rc != 0:
+            raise RuntimeError(f"Could not measure latency of '{chain}':\n{err.strip()}")
+        out, _ = sf.read(dst, dtype="float32")
+
+    peak = int(np.argmax(np.abs(out)))
+    latency = peak - sample_rate
+    if np.abs(out[peak]) < 1e-4 or not 0 <= latency < sample_rate:
+        latency = 0  # the impulse did not survive; assume no shift rather than guess
+    _latency_cache[key] = latency
+    return latency
+
+
+def compensated(chain, sample_rate, measure_chain=None):
+    """`chain` wrapped so its output lines up with its input, length unchanged.
+
+    The input tail is padded by the latency before filtering, so the filter
+    flushes the real end of the audio, then the same amount is trimmed off the
+    front. `measure_chain` lets callers measure a variant of the chain that has
+    no runtime commands (asendcmd) attached.
+    """
+    latency = filter_latency(measure_chain or chain, sample_rate)
+    if latency == 0:
+        return chain
+    return (f"apad=pad_len={latency},{chain},"
+            f"atrim=start_sample={latency},asetpts=PTS-STARTPTS")

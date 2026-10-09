@@ -83,3 +83,28 @@ def test_demucs_separates_speech_from_music(fx, tmp_path):
     mix, _ = M.load_mono(fx.mix_music)
     v, _ = M.load_mono(vocals)
     assert M.snr_db(clean, v) >= M.snr_db(clean, mix) + 8
+
+
+def test_full_pipeline_keeps_audio_in_sync(fx, tmp_path):
+    """B6, end to end: every stage together must not shift the audio."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    clean_audio = Path(sys.executable).with_name("clean-audio")
+    out_dir = tmp_path / "o"
+    subprocess.run(
+        [str(clean_audio), str(fx.video), "--output_dir", str(out_dir),
+         "--skip_first_n_sec", "8s", "--process_n_seconds", "20s",
+         "--filter_audio_only", "--normalize", "--audio_gain", "2dB",
+         "--reduce_hiss", "--declick"],
+        check=True, capture_output=True, text=True)
+    produced, sr = M.load_mono(next(out_dir.glob("*.wav")))
+    reference, _ = M.load_mono(fx.mix_noisy)
+    reference = reference[8 * sr:28 * sr]
+    n = min(len(produced), len(reference))
+    corr = np.fft.irfft(np.fft.rfft(produced[:n], 2 * n) * np.conj(np.fft.rfft(reference[:n], 2 * n)))
+    window = int(0.2 * sr)
+    lags = np.concatenate([corr[-window:], corr[:window + 1]])
+    lag = int(np.argmax(lags)) - window
+    assert abs(lag) <= 1, f"audio shifted by {lag} samples ({lag / sr * 1000:.1f} ms)"
+    assert abs(len(produced) - 20 * sr) <= 1

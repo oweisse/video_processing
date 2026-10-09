@@ -83,8 +83,8 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `input_video` | *(required)* | Path to the input video or audio file. |
 | `--output_dir` | **required** | Directory every output is written to. Created if missing. |
 | `-o, --output` | derived | Output **filename** (not a path) placed inside `--output_dir`. |
-| `--skip_first_n_sec` | `0` | Skip this much at the start (`8m50s`, `90`, `45s`). |
-| `--process_n_seconds` | to end | Process only this much (`3m30s`, `45s`). |
+| `--skip_first_n_sec` | `0` | Skip this much at the start (`8m50s`, `1h20m`, `90`). See *Time values* below. |
+| `--process_n_seconds` | to end | Process only this much (`3m30s`, `45s`). Must be > 0. |
 | `--filter_audio_only` | off | Write a 24-bit WAV instead of merging into video. |
 | `--compare [SECONDS]` | off (`20` if bare) | Preview mode — see below. |
 | `--atten_lim_db` | `30` | Cap noise attenuation, in dB. `none` = unlimited. |
@@ -95,7 +95,9 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--audio_gain` | off | Extra gain after denoising (`6dB`, `2.0`), then limited. |
 | `--reduce_hiss` | off | Extra pass to reduce steady background hiss. See below. |
 | `--hiss_method` | `profile` | `profile` (learned noise fingerprint) or `patch`. |
-| `--noise_profile_at` | auto | Where to sample noise for `profile` mode. |
+| `--noise_profile_at` | auto | Where to sample noise for `profile` mode, relative to `--skip_first_n_sec`. |
+| `--noise_profile_len` | `1` | Length of the noise sample, seconds. |
+| `--noise_profile_max_excess_db` | `6` | Warn when the auto-picked sample sits this far above the noise floor (likely speech). |
 | `--hiss_nr` | `12` | Strength for `profile` mode, in dB. |
 | `--hiss_gain_smooth` | `0` | Raise (0–50) if `profile` mode still warbles. |
 | `--hiss_strength` | `0.0003` | Strength for `patch` mode. |
@@ -111,6 +113,14 @@ is piped to a file, it prints a plain progress line every 5 seconds instead.
 | `--video_crf` | `18` | x264 quality for `--precise_cut`. |
 | `--audio_bitrate` | `192k` | AAC bitrate of the merged video. |
 | `--keep_temp DIR` | off | Copy intermediate WAVs to DIR for debugging. |
+
+### Time values
+
+Times accept plain seconds (`90`, `1.5`) or hours/minutes/seconds in that order:
+`1h20m`, `1h20m5s`, `8m50s`, `5m30` (a bare number after minutes is seconds), `45s`.
+Anything else is rejected with an error — including negative values, `1h30` (ambiguous:
+minutes or seconds?) and units out of order. Windows past the first hour are named in
+hours, e.g. `…_01h01m00s-01h01m20s.mp4`.
 
 ### Tuning `--atten_lim_db` (the knob that matters most)
 
@@ -249,6 +259,14 @@ of waiting for a full run.
 timestamp with no keyframe snapping.
 
 ### Audio/video sync
+
+Several of the filters used here (`afftdn` for profile hiss and declick, `anlmdn` for
+patch hiss, and the limiter) look ahead, and ffmpeg delays their output instead of
+compensating. Uncorrected, `--reduce_hiss --declick` put the audio about 50 ms behind
+the picture. Each such filter's delay is now measured once with an impulse and removed,
+so the cleaned audio lines up with the video to the sample; a slow test checks the whole
+pipeline end to end.
+
 
 Stream-copy seeking can only land on a keyframe, so the tool snaps the cut back to the
 nearest keyframe at or before your requested start and uses that same point for both
