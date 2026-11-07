@@ -15,6 +15,8 @@ APPENDIX_C = {
     "target_lufs": -16.0,
     "target_tp": -1.5,
     "target_lra": 11.0,
+    "target_lufs_max": -16.0,
+    "target_lufs_min": -24.0,
     "limiter_ceiling": 0.97,
     "silence_warn_lufs": -45.0,
     "loudness_tolerance_db": 2.0,

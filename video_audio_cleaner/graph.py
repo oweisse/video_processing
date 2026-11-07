@@ -76,12 +76,15 @@ def loudnorm_filter(o, measure=False):
     base = f"loudnorm=I={o.target_lufs:g}:TP={o.target_tp:g}:LRA={o.target_lra:g}"
     if measure:
         return base + ":print_format=json"
+    # print_format=json on the applying pass too: loudnorm silently falls back
+    # from linear to dynamic (compressing) when linear gain would break the true-peak
+    # ceiling, and its JSON is the only place that says which one it did.
     m = o.measured
     if not m:
-        return base
+        return base + ":print_format=json"
     return (f"{base}:measured_I={m['input_i']}:measured_TP={m['input_tp']}"
             f":measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}"
-            f":offset={m['target_offset']}:linear=true")
+            f":offset={m['target_offset']}:linear=true:print_format=json")
 
 
 def _aligned(chain, latency, trim_extra=0):

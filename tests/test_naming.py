@@ -65,3 +65,38 @@ def test_window_to_end_of_file_is_explicit():
 
 def test_window_unknown_file_length():
     assert plan_window(0.0, 0.0, None, None) == (0.0, None, None)
+
+
+# ---------------------------------------------------------------- --tag and the -o guard
+from video_audio_cleaner.cli import check_name_window  # noqa: E402
+
+
+def test_tag_follows_the_window():
+    assert name(tag="no-music") == "04-chat_07m00s-08m00s_no-music.mp4"
+    assert name(tag="x", compare_mode=True) == "04-chat_compare_07m00s-08m00s_x.wav"
+
+
+def test_tag_flag_parses():
+    from video_audio_cleaner.cli import build_parser
+    args = build_parser().parse_args(["in.mp4", "--output_dir", "o", "--tag", "no-music"])
+    assert args.tag == "no-music"
+
+
+@pytest.mark.parametrize("given, start, end", [
+    ("02-wedding_09m10s-09m20s_no-music.mp4", 550, 560),
+    ("mine.mp4", 550, 560),                      # no window in the name: anything goes
+    ("x_01h05m00s-01h05m25s.mp4", 3900, 3925),
+    ("x_07m00s-end.mp4", 420, None),
+])
+def test_name_window_matching_the_run_is_accepted(given, start, end):
+    check_name_window(given, start, end)
+
+
+@pytest.mark.parametrize("given, start, end", [
+    ("02-wedding_09m10s-12m20s_no-music.mp4", 550, 560),  # the stale-end-time case
+    ("x_09m00s-09m20s.mp4", 550, 560),
+    ("x_07m00s-end.mp4", 420, 480),
+])
+def test_name_window_not_matching_the_run_is_refused(given, start, end):
+    with pytest.raises(RuntimeError, match="--tag"):
+        check_name_window(given, start, end)

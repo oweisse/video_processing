@@ -20,7 +20,7 @@ def test_nothing_enabled_needs_no_render():
 
 def test_normalize_only():
     assert g(normalize=True) == (
-        "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[level];"
+        "[0:a]loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json,aresample=48000[level];"
         "[level]ebur128=peak=true,aresample=48000[out]")
 
 
@@ -28,7 +28,8 @@ def test_normalize_uses_measured_values_linearly():
     m = dict(input_i="-31.9", input_tp="-15.5", input_lra="6.1",
              input_thresh="-42.3", target_offset="0.02")
     assert ("loudnorm=I=-16:TP=-1.5:LRA=11:measured_I=-31.9:measured_TP=-15.5:"
-            "measured_LRA=6.1:measured_thresh=-42.3:offset=0.02:linear=true") in g(
+            "measured_LRA=6.1:measured_thresh=-42.3:offset=0.02:linear=true"
+            ":print_format=json") in g(
                 normalize=True, measured=m)
 
 

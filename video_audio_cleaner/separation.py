@@ -4,6 +4,7 @@ Demucs is a masking model, not a generative one: the vocal stem is built from
 the original recording, so speaker identity is preserved. Splitting music off
 before denoising matters because DeepFilterNet targets noise, not music.
 """
+import os
 from pathlib import Path
 
 from .audioio import write_wav
@@ -73,6 +74,38 @@ def _separate_once(input_wav, device, segment, duration_sec, prefix):
     return separator, stems
 
 
+DEMUCS_REPO = "adefossez/HTDemucs"
+
+
+def use_cached_model_offline():
+    """Load Demucs without asking the Hugging Face Hub, once its files are cached.
+
+    Demucs fetches htdemucs through huggingface_hub, which otherwise checks the
+    hub for a newer revision on every load (no audio is sent; only the file
+    names) and prints a rate-limit warning. Only this process is affected. The
+    first run still downloads the model. Returns True when offline.
+    """
+    try:
+        import yaml
+        from huggingface_hub import constants, try_to_load_from_cache
+    except ImportError:
+        return False
+    bag = try_to_load_from_cache(DEMUCS_REPO, "htdemucs.yaml")
+    if not isinstance(bag, str):
+        return False
+    try:
+        with open(bag) as file:
+            signatures = yaml.safe_load(file)["models"]
+    except (OSError, KeyError, TypeError, yaml.YAMLError):
+        return False
+    if not all(isinstance(try_to_load_from_cache(DEMUCS_REPO, f"{sig}.safetensors"), str)
+               for sig in signatures):
+        return False
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    constants.HF_HUB_OFFLINE = True   # read at import time; huggingface_hub may be loaded
+    return True
+
+
 def separate_to_files(input_wav, vocals_path, music_path, target_sr,
                       duration_sec=None, device="auto", segment=None,
                       prefix="Separating"):
@@ -80,6 +113,7 @@ def separate_to_files(input_wav, vocals_path, music_path, target_sr,
 
     Returns (vocals_path, music_path).
     """
+    use_cached_model_offline()
     try:
         import torch
         import torchaudio

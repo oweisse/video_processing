@@ -7,12 +7,16 @@ Normalising before denoising would amplify the noise the denoiser is meant to
 remove, and can clip.
 """
 import argparse
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from pathlib import Path
 
 from . import ffmpeg_utils, graph, procs
 from .console import print_error, print_info, print_step, print_success, print_warning
@@ -48,6 +52,16 @@ def parse_atten_lim(value):
     return None if number <= 0 else number
 
 
+def parse_target_lufs(value):
+    if str(value).strip().lower() == "auto":
+        return "auto"
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --target_lufs value: '{value}'. Expected a number of LUFS or 'auto'.")
+
+
 def parse_music_level(value):
     if value is None:
         return None
@@ -78,7 +92,13 @@ def build_parser():
                              "Created if missing.")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Output FILENAME (not a path) placed inside --output_dir. "
-                             "Defaults to a name derived from the input and time window.")
+                             "Defaults to a name derived from the input and time window. "
+                             "A time window written in the name (e.g. 09m10s-12m20s) must "
+                             "match the window processed; to label an output, use --tag.")
+    parser.add_argument("--tag", type=str, default=None,
+                        help="Label appended to the automatic output name, e.g. --tag "
+                             "no-music gives NAME_09m10s-09m20s_no-music.mp4. The window "
+                             "part always follows --skip_first_n_sec/--process_n_seconds.")
 
     parser.add_argument("--skip_first_n_sec", type=parse_time_string, default=None,
                         help="Skip this much at the start (e.g. '8m50s', '90').")
@@ -93,6 +113,21 @@ def build_parser():
                              "of the window and write original+processed into one WAV "
                              "for A/B auditioning. Skips the video merge.")
 
+    parser.add_argument("--autotune", action="store_true",
+                        help="Choose --atten_lim_db, hiss reduction and --declick "
+                             "automatically for this window: try a grid of settings, score "
+                             "each against the source, render with the best. Results are "
+                             "cached per video and reused for the same window.")
+    parser.add_argument("--source", choices=("tape", "digital"), default=None,
+                        help="What the recording came from, for --autotune (asked "
+                             "when not given). 'tape' = Super-8, VHS or other tape "
+                             "transfer. 'digital' (a camera or phone video, not a tape "
+                             "transfer) leaves hiss reduction and declick off: on such "
+                             "recordings they only strip the room tone and reverb.")
+    parser.add_argument("--autotune_dir", type=str, default=None,
+                        help="Tuning cache for --autotune (default: "
+                             "OUTPUT_DIR/_tuning/<video name>, shared with clean-audio-tune "
+                             "and clean-audio-batch).")
     parser.add_argument("--atten_lim_db", type=parse_atten_lim, default=20.0,
                         help="Limit noise attenuation to this many dB (default: 20). "
                              "Lower (e.g. 10) for quiet or distant speech, or if voices "
@@ -105,8 +140,11 @@ def build_parser():
 
     parser.add_argument("--normalize", action="store_true",
                         help="Two-pass loudness normalisation of the CLEANED audio.")
-    parser.add_argument("--target_lufs", type=float, default=-16.0,
-                        help="Target integrated loudness for --normalize (default: -16).")
+    parser.add_argument("--target_lufs", type=parse_target_lufs, default=-16.0,
+                        help="Target integrated loudness for --normalize (default: -16). "
+                             "'auto' picks the loudest target a plain volume change can "
+                             "reach, so loudnorm never compresses the dynamics; on by "
+                             "default with --autotune.")
     parser.add_argument("--audio_gain", type=str, default=None,
                         help="Extra gain applied AFTER denoising (e.g. '6dB' or '2.0'), "
                              "followed by a limiter. Usually unnecessary with --normalize.")
@@ -166,7 +204,8 @@ def build_parser():
                         help="Split speech from music with Demucs before denoising.")
     parser.add_argument("--music_level_db", type=parse_music_level, default=-12.0,
                         help="Level to mix the separated music back under the speech "
-                             "(default: -12). Pass 'off' to drop music entirely.")
+                             "(default: -12). Pass 'off' to drop music entirely. With "
+                             "--autotune it is chosen per window unless you give it.")
     parser.add_argument("--separation_device", type=str, default="auto",
                         choices=("auto", "cpu", "mps"),
                         help="Device for Demucs (default: auto = try MPS, fall back to CPU).")
@@ -190,6 +229,11 @@ def build_parser():
                           help="True-peak ceiling for --normalize, dBTP (default: -1.5).")
     advanced.add_argument("--target_lra", type=float, default=DEFAULT_TARGET_LRA,
                           help="Loudness range target for --normalize, LU (default: 11).")
+    advanced.add_argument("--target_lufs_max", type=float, default=-16.0,
+                          help="Loudest target --target_lufs auto may choose (default: -16).")
+    advanced.add_argument("--target_lufs_min", type=float, default=-24.0,
+                          help="Quietest target --target_lufs auto may choose; below it, "
+                               "gentle compression is accepted instead (default: -24).")
     advanced.add_argument("--limiter_ceiling", type=float, default=DEFAULT_LIMITER_CEILING,
                           help="Limiter ceiling after --audio_gain and the music mix, "
                                "linear 0-1 (default: 0.97).")
@@ -253,6 +297,42 @@ def _validate_output_name(name):
     return name
 
 
+_NAME_WINDOW = re.compile(
+    r"(?<![\dhms])((?:\d+h)?\d+m\d+s)-((?:\d+h)?\d+m\d+s|end)(?![\dhms])", re.I)
+
+
+def _validate_tag(tag):
+    if tag is None:
+        return None
+    separators = [os.sep] + ([os.altsep] if os.altsep else [])
+    if not tag.strip() or any(sep in tag for sep in separators) or tag in (".", ".."):
+        raise RuntimeError(f"--tag must be a short label without path separators, got '{tag}'.")
+    return tag.strip()
+
+
+def check_name_window(name, start, end):
+    """Refuse a hand-given name whose written time window is not the one processed.
+
+    start/end are seconds (end None = to the end of the file). A name with no
+    window in it is fine. Returns None or raises RuntimeError.
+    """
+    match = _NAME_WINDOW.search(os.path.splitext(name)[0])
+    if not match:
+        return
+    named_start = parse_time_string(match.group(1))
+    named_end = None if match.group(2).lower() == "end" else parse_time_string(match.group(2))
+    start_ok = abs(named_start - start) < 1
+    end_ok = (named_end is None and end is None) or (
+        named_end is not None and end is not None and abs(named_end - end) < 1)
+    if start_ok and end_ok:
+        return
+    actual = f"{format_time_filename(start)}-{format_time_filename(end)}"
+    raise RuntimeError(
+        f"-o/--output says {match.group(0)}, but this run processes {actual}.\n"
+        f"Drop -o to get the right name automatically, and add a label with --tag "
+        f"(e.g. --tag no-music), or fix the time in the name.")
+
+
 def plan_window(requested_start, actual_start, requested_duration, file_duration):
     """(snap_delta, actual_duration, work_duration) for the processed window.
 
@@ -272,8 +352,8 @@ def plan_window(requested_start, actual_start, requested_duration, file_duration
 
 
 def derive_output_name(input_path, requested_start, requested_duration, file_duration,
-                       has_window, compare_mode, audio_only):
-    """Output filename: the input's name plus the window the user asked for."""
+                       has_window, compare_mode, audio_only, tag=None):
+    """Output filename: the input's name plus the window the user asked for (+ --tag)."""
     base_name, _ = os.path.splitext(os.path.basename(input_path))
     time_suffix = ""
     if has_window:
@@ -283,6 +363,8 @@ def derive_output_name(input_path, requested_start, requested_duration, file_dur
             end_sec = file_duration
         time_suffix = (f"_{format_time_filename(requested_start)}"
                        f"-{format_time_filename(end_sec)}")
+    if tag:
+        time_suffix += f"_{tag}"
     if compare_mode:
         return f"{base_name}_compare{time_suffix}.wav"
     if audio_only:
@@ -308,9 +390,86 @@ def _format_failure(exc):
     return str(exc) or repr(exc)
 
 
-def _stage_chain(args, o, compare_mode, audio_only):
+# The knobs --autotune chooses; passing one explicitly alongside it is an error.
+AUTOTUNED_OPTIONS = ("--atten_lim_db", "--reduce_hiss", "--hiss_method", "--hiss_nr",
+                     "--hiss_strength", "--declick", "--declick_nr")
+
+
+def _explicit(argv, option):
+    return any(a == option or a.startswith(option + "=") for a in argv)
+
+
+def _autotune(args, argv, input_path, output_dir, start, duration):
+    """Pick the tuned settings for this window and apply them to args."""
+    from . import tune
+
+    clash = [o for o in AUTOTUNED_OPTIONS if _explicit(argv, o)]
+    if clash:
+        raise RuntimeError(
+            f"--autotune chooses {', '.join(clash)} itself; drop "
+            f"{'it' if len(clash) == 1 else 'them'}, or drop --autotune to set them by hand.")
+    if duration is None:
+        raise RuntimeError("--autotune needs a known window length "
+                           "(--process_n_seconds, or a file whose duration ffprobe can read).")
+    if duration > 600:
+        print_warning(f"Autotuning {duration / 60:.0f} minutes of audio takes roughly "
+                      f"{duration * 0.8 / 60:.0f} minutes. Shorter windows tune faster.")
+    tune_dir = Path(args.autotune_dir) if args.autotune_dir else \
+        tune.default_tune_dir(output_dir, input_path, args.separate_music)
+
+    try:
+        args.source = tune.resolve_source(args.source)
+    except SystemExit as exc:
+        raise RuntimeError(str(exc)) from None
+    print_info(f"\nAutotune: choosing settings for this window (cache: {tune_dir})")
+    began = time.time()
+    # With --separate_music autotune also picks the music bed level, unless the
+    # user set --music_level_db: then it tunes the rest around that level.
+    fixed_music = None
+    if args.separate_music and _explicit(argv, "--music_level_db"):
+        fixed_music = "off" if args.music_level_db is None else f"{args.music_level_db:g}"
+    picked, entry, reused, plan_path = tune.autotune_window(
+        input_path, start, start + duration, tune_dir, args.separate_music, fixed_music,
+        args.source)
+
+    args.atten_lim_db = picked.atten
+    args.reduce_hiss = picked.hiss != "off"
+    if args.reduce_hiss:
+        method, value = picked.hiss.split(":")
+        args.hiss_method = method
+        if method == "profile":
+            args.hiss_nr = float(value)
+        else:
+            args.hiss_strength = float(value)
+    if args.separate_music:
+        args.music_level_db = picked.music_level_db
+    args.declick = bool(picked.declick)
+    if args.declick:
+        args.declick_nr = picked.declick_nr
+
+    how = "reused earlier tuning" if reused else \
+        f"tuned {len(entry['candidates'])} candidates in {time.time() - began:.0f}s"
+    print_success(f"Autotune picked: {picked.describe()} ({how})")
+    print_info(f"  fidelity {picked.fidelity:.3f}, hiss removed {picked.hiss_gain_db:+.1f} dB, "
+               f"ticks {entry['source']['clicks']:.1f} → {picked.clicks:.1f}/s")
+    return {
+        "cache": str(plan_path),
+        "reused": reused,
+        "window": entry["label"],
+        "criteria": json.loads(plan_path.read_text(encoding="utf-8")).get("criteria"),
+        "music_bed": entry.get("music"),
+        "picked": {k: getattr(picked, k) for k in ("atten", "hiss", "declick",
+                                                   "music_level_db", "fidelity",
+                                                   "hiss_gain_db", "warble", "clicks",
+                                                   "score")},
+        "candidates_tried": len(entry["candidates"]),
+    }
+
+
+def _stage_chain(args, o, compare_mode, audio_only, auto_loudness=False):
     atten = "unlimited" if args.atten_lim_db is None else f"{args.atten_lim_db:g}"
-    chain = ["extract"]
+    chain = ["autotune"] if args.autotune else []
+    chain.append("extract")
     if args.separate_music:
         chain.append("separate (Demucs)")
     chain.append(f"denoise (atten {atten})")
@@ -319,7 +478,8 @@ def _stage_chain(args, o, compare_mode, audio_only):
     elif o.hiss_method == "patch":
         chain.append(f"hiss (patch, strength {o.hiss_strength:g})")
     if o.normalize:
-        chain.append(f"loudnorm ({o.target_lufs:g} LUFS)")
+        chain.append(f"loudnorm (auto, ≤ {o.target_lufs:g} LUFS)" if auto_loudness
+                     else f"loudnorm ({o.target_lufs:g} LUFS)")
     if o.audio_gain:
         chain.append(f"gain {o.audio_gain}")
     if o.music_level_db is not None:
@@ -332,6 +492,37 @@ def _stage_chain(args, o, compare_mode, audio_only):
     return chain
 
 
+def _choose_loudness_target(o, measured, args, results, denoised_wav, duration):
+    """Set the loudest plain-volume target, re-measure for it, and record the choice."""
+    from . import postprocess
+
+    pick = postprocess.auto_loudness_target(measured, args.target_lufs_max,
+                                            args.target_lufs_min, o.target_tp, o.target_lra)
+    o.target_lufs, o.target_lra = pick.target_lufs, pick.target_lra
+    args.target_lufs, args.target_lra = pick.target_lufs, pick.target_lra   # for .params.json
+    results["loudness_target"] = {"chosen_lufs": pick.target_lufs,
+                                  "chosen_lra": pick.target_lra,
+                                  "reachable_without_compression_lufs": round(
+                                      pick.reachable_lufs, 2),
+                                  "linear": pick.linear}
+    if pick.linear:
+        why = ("the cap" if pick.target_lufs == args.target_lufs_max else
+               f"the loudest a plain volume change reaches with peaks under "
+               f"{o.target_tp:g} dBTP")
+        print_success(f"Loudness target chosen: {pick.target_lufs:g} LUFS ({why}).")
+    else:
+        # Don't predict compression: the margin is conservative, and the render reports
+        # the mode loudnorm actually used.
+        print_info(f"Loudness target chosen: {pick.target_lufs:g} LUFS, the floor "
+                   f"(--target_lufs_min). A plain volume change reaches about "
+                   f"{pick.reachable_lufs:.1f} LUFS here; the render reports whether "
+                   f"loudnorm had to compress.")
+    # loudnorm's second-pass correction depends on the target: measure again for it.
+    remeasured = postprocess.analyse(o, denoised_wav, duration,
+                                     label="Re-measuring for the chosen target")
+    return remeasured or measured
+
+
 def _report_render(o, result, args):
     """One line per stage the shared render pass performed, with what it did."""
     if o.hiss_method == "profile":
@@ -340,8 +531,18 @@ def _report_render(o, result, args):
     elif o.hiss_method == "patch":
         print_success(f"Hiss reduction (patch, strength {o.hiss_strength:g})")
     if o.normalize:
-        how = "two-pass, linear" if o.measured else "single-pass"
-        print_success(f"Loudness normalised ({how}, target {o.target_lufs:g} LUFS)")
+        mode = result.loudnorm_mode or "unknown mode"
+        passes = "two-pass" if o.measured else "single-pass"
+        print_success(f"Loudness normalised ({passes}, {mode}, target {o.target_lufs:g} LUFS)")
+        if result.loudnorm_mode == "dynamic" and o.measured:
+            need = o.target_lufs - float(o.measured["input_i"])
+            over = float(o.measured["input_tp"]) + need - o.target_tp
+            print_warning(
+                f"loudnorm compressed the dynamics: reaching {o.target_lufs:g} LUFS needs "
+                f"{need:+.1f} dB, which would put peaks {over:.1f} dB over the "
+                f"{o.target_tp:g} dBTP ceiling. Quiet passages are brought up relative "
+                f"to loud ones. For a plain volume change instead, lower --target_lufs "
+                f"to about {o.target_lufs - over:.0f}.")
     if o.audio_gain:
         print_success(f"Gain {o.audio_gain}, limited at {o.limiter_ceiling:g}")
     if o.music_level_db is not None:
@@ -375,13 +576,17 @@ class _Steps:
 # --------------------------------------------------------------------------
 # pipeline
 # --------------------------------------------------------------------------
-def _run(args):
+def _run(args, argv=None):
     input_path = os.path.abspath(os.path.expanduser(args.input_video))
     if not os.path.exists(input_path):
         raise RuntimeError(f"Input file not found at: {input_path}")
 
     output_dir = _prepare_output_dir(args.output_dir)
     _validate_output_name(args.output)
+    args.tag = _validate_tag(args.tag)
+    if args.tag and args.output:
+        raise RuntimeError("--tag labels the automatic name; with -o, write the label into "
+                           "the name yourself (or drop -o).")
 
     keep_temp_dir = None
     if args.keep_temp:
@@ -438,7 +643,14 @@ def _run(args):
                     or args.process_n_seconds is not None or compare_mode),
         compare_mode=compare_mode,
         audio_only=audio_only,
+        tag=args.tag,
     )
+    if args.output:
+        if requested_duration is not None:
+            named_end = requested_start + requested_duration
+        else:
+            named_end = file_duration
+        check_name_window(args.output, requested_start, named_end)
     output_path = os.path.join(output_dir, args.output or default_name)
 
     # The derived name is now just the input's name plus the window, so with no
@@ -452,6 +664,13 @@ def _run(args):
     print_info(f"Input Video:  {input_path}")
     print_info(f"Output Dir:   {output_dir}")
     print_info(f"Output File:  {os.path.basename(output_path)}")
+    if os.path.exists(output_path):
+        from .provenance import sidecar_path
+        replaced = [os.path.basename(output_path)]
+        if os.path.exists(sidecar_path(output_path)):
+            replaced.append(os.path.basename(str(sidecar_path(output_path))))
+        print_warning(f"{' and '.join(replaced)} already exist(s) in the output folder "
+                      f"and will be replaced when this run finishes.")
     if work_duration:
         print_info(f"Window:       {work_duration:.2f}s starting at {actual_start:.2f}s")
     else:
@@ -461,6 +680,25 @@ def _run(args):
     if args.audio_gain and args.normalize:
         print_warning("--audio_gain on top of --normalize is usually unnecessary; "
                       "the gain is applied after normalisation and then limited.")
+
+    if args.source and not args.autotune:
+        print_warning("--source only steers --autotune; without it, your own settings apply.")
+
+    results = {}
+    if args.autotune:
+        tune_length = requested_duration
+        if tune_length is None and file_duration is not None:
+            tune_length = max(0.0, file_duration - requested_start)
+        results["autotune"] = _autotune(args, argv or [], input_path, output_dir,
+                                        requested_start, tune_length)
+
+    # Loudness target: a number, or chosen from the cleaned audio ('auto').
+    # --autotune implies auto unless the user set a target themselves.
+    auto_loudness = args.normalize and (
+        args.target_lufs == "auto"
+        or (args.autotune and not _explicit(argv or [], "--target_lufs")))
+    if auto_loudness:
+        args.target_lufs = args.target_lufs_max      # provisional, for the first measurement
 
     graph_opts = graph.GraphOptions(
         sample_rate=SAMPLE_RATE,
@@ -487,7 +725,7 @@ def _run(args):
     # Rule: the user can always see which stages run, which pass is active and
     # how far it is. Print the whole chain once, before any work starts.
     print_info("Stages:       " + " → ".join(_stage_chain(args, graph_opts, compare_mode,
-                                                         audio_only)))
+                                                         audio_only, auto_loudness)))
 
     total_steps = 2  # extract + denoise
     if args.separate_music:
@@ -598,7 +836,12 @@ def _run(args):
                 else:
                     print_success(f"Measured {float(measured['input_i']):.1f} LUFS "
                                   f"before normalising.")
+                if auto_loudness and measured is not None:
+                    measured = _choose_loudness_target(graph_opts, measured, args, results,
+                                                       denoised_wav, work_duration)
                 graph_opts.measured = measured
+                if measured is not None:
+                    results["lufs_before_normalize"] = float(measured["input_i"])
 
             steps.start("Rendering: " + " → ".join(render_stages))
             result = postprocess.render(
@@ -608,6 +851,11 @@ def _run(args):
                 label="Rendering " + "→".join(render_stages))
             _report_render(graph_opts, result, args)
             processed_wav = final_wav
+            results["final_lufs"] = result.lufs
+            results["loudnorm_mode"] = result.loudnorm_mode
+            results["final_true_peak_dbtp"] = result.true_peak
+            if graph_opts.noise_at is not None:
+                results["noise_profile_sampled_at_sec"] = round(graph_opts.noise_at, 3)
 
         # -- Final output ---------------------------------------------------
         if compare_mode:
@@ -624,6 +872,8 @@ def _run(args):
         if keep_temp_dir:
             _copy_intermediates(temp_dir, keep_temp_dir)
 
+        _write_sidecar(output_path, args, input_path, output_dir, requested_start,
+                       requested_duration, actual_start, actual_duration, results)
         print_success(f"Processing complete! Saved to: {output_path}")
         if compare_mode:
             print_success(f"A/B preview (original → 0.5s silence → processed):\n"
@@ -643,6 +893,34 @@ def _cleanup_temp(temp_dir, keep_temp_dir=None):
         _copy_intermediates(temp_dir, keep_temp_dir)
     procs.unregister_path(temp_dir)
     shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _write_sidecar(output_path, args, input_path, output_dir, requested_start,
+                   requested_duration, actual_start, actual_duration, results):
+    """<output>.params.json: every parameter (defaults too) and how to reproduce it."""
+    from . import provenance
+
+    resolved = argparse.Namespace(**vars(args))
+    # Record what actually ran: autotune's picks are already in these values, so
+    # the reproduce command renders the same file without tuning again.
+    resolved.autotune = False
+    resolved.autotune_dir = None
+    resolved.input_video = input_path
+    resolved.output_dir = output_dir
+    resolved.output = os.path.basename(output_path)
+    resolved.tag = None  # already part of the output name
+    window = {
+        "requested_start_sec": requested_start,
+        "requested_duration_sec": requested_duration,
+        "actual_start_sec": round(actual_start, 6),
+        "actual_duration_sec": None if actual_duration is None else round(actual_duration, 6),
+        "keyframe_snap_sec": round(requested_start - actual_start, 6),
+    }
+    try:
+        path = provenance.write(output_path, build_parser(), resolved, window, results)
+        print_info(f"Parameters recorded in {path.name}")
+    except OSError as exc:
+        print_warning(f"Could not write the parameters file: {exc}")
 
 
 def _copy_intermediates(temp_dir, keep_temp_dir):
@@ -722,7 +1000,7 @@ def main():
     args = build_parser().parse_args()
     ffmpeg_utils.VERBOSE = args.verbose
     try:
-        _run(args)
+        _run(args, sys.argv[1:])
     except KeyboardInterrupt:
         procs.cleanup_all()
         print_warning("Interrupted — cleaned up temporary files.")

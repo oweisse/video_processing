@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.0
+
+**Added**
+- `--tag LABEL` adds a label to the automatic output name, after the window
+  (`video_09m10s-09m20s_no-music.mp4`).
+- Tuning tries declick strengths (`--declick off,12,20` by default; was `off,on`), and
+  autotune applies the chosen `--declick_nr`.
+- With `--separate_music`, tuning and `--autotune` choose the music bed level: the
+  quietest that masks Demucs's residue (`--music_levels`, `--max_music_warble_increase`).
+  Dropping the music entirely left a watery, echo-like residue on loud music. Candidates
+  are scored against speech + bed. Tuning method 4.
+- `--source tape|digital` (clean-audio with `--autotune`, clean-audio-tune,
+  clean-audio-batch). `digital` leaves hiss reduction and declick out of tuning: on
+  modern recordings they only strip room tone, and the scores cannot tell. Asked
+  interactively when tuning without it.
+- A run that will replace an existing output (and its `.params.json`) says so up front.
+- `clean-audio --autotune`: picks attenuation, hiss reduction and declick for the window
+  automatically, renders with the pick, and records the scores in `.params.json`. Uses
+  and extends the per-video tuning cache, so a window is never tuned twice.
+- `--target_lufs auto`: the loudest loudness target reachable by a plain volume change
+  (between `--target_lufs_max` −16 and `--target_lufs_min` −24), so `loudnorm` does not
+  compress the voices. Default with `--autotune` and in tuning plans. The chosen value
+  is recorded in `.params.json`.
+- `clean-audio-tune`: tries a grid of settings on each window, scores every candidate
+  against the source, and writes a report, per-window A/B listening files and a
+  `plan.json` with the picked flags. Saved after every window and resumed on rerun:
+  windows already tuned are kept, only new ones are tuned (`--retune` to redo).
+- Tuning cache is per video, at `OUTPUT_DIR/_tuning/<video name>/`; tuning that cannot
+  be merged (another video, another grid, `--retune`) is archived, never overwritten.
+- `clean-audio-batch`: renders a tuned plan, or with `--video` reuses existing tuning
+  for those windows (tuning only if missing or `--retune`). Prints the plan and every
+  command line before running any; records the tuning in each output's
+  `.params.json`; skips existing outputs; `--dry-run`, `--only`, `--force`.
+- Tuning judges each window against its own gentlest and least-warbly candidates (no
+  absolute fidelity bar), and measures candidates before loudness normalisation.
+  Changing only the criteria re-scores saved measurements without rendering.
+- `<output>.params.json` next to every output: all parameters including defaults, a
+  reproduce command (tested to round-trip exactly), the actual window after keyframe
+  snapping, measured results, and tool, git and library versions.
+
+**Fixed**
+- `-o` with a time window in the name that differs from the window processed (e.g.
+  `_09m10s-12m20s` on a 10 s run) is refused, so stale names can no longer label the
+  wrong audio. Use `--tag` for labels instead.
+- Tuning's warble bar came from the calmest candidate overall, even one that failed
+  fidelity. It now comes from the calmest candidate that keeps the voices. On the
+  wedding tape this had rejected declick by 0.02 warble.
+- With `--separate_music`, tuning scored candidates against the music-laden source, so
+  removing the music counted as lost fidelity. It now scores against the speech stem,
+  rendered without the music bed. Tuning method 3: older caches are archived and
+  re-tuned on first use.
+- The loudness report said "linear" even when `loudnorm` had fallen back to dynamic
+  (compressing) mode, which it does on quiet material. It now reports the mode loudnorm
+  actually used, warns when it compressed, suggests the target for a plain volume
+  change, and records the mode in `.params.json`.
+
 ## 0.3.0
 
 Review fixes (`fable_review_plan.md`). Every change below is covered by the test suite

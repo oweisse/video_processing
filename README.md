@@ -122,7 +122,8 @@ command is always printed with its error.
 |------|---------|-------------|
 | `input_video` | *(required)* | Path to the input video or audio file. |
 | `--output_dir` | **required** | Directory every output is written to. Created if missing. |
-| `-o, --output` | derived | Output **filename** (not a path) placed inside `--output_dir`. |
+| `-o, --output` | derived | Output **filename** (not a path) placed inside `--output_dir`. A time window written in it (`09m10s-12m20s`) must match the window processed. |
+| `--tag` | none | Label added to the automatic name: `--tag no-music` → `video_09m10s-09m20s_no-music.mp4`. |
 | `--skip_first_n_sec` | `0` | Skip this much at the start (`8m50s`, `1h20m`, `90`). See *Time values* below. |
 | `--process_n_seconds` | to end | Process only this much (`3m30s`, `45s`). Must be > 0. |
 | `--filter_audio_only` | off | Write a 24-bit WAV instead of merging into video. |
@@ -131,7 +132,7 @@ command is always printed with its error.
 | `--chunk_len_sec` | `10` | Denoiser chunk length. |
 | `--crossfade_sec` | `0.5` | Crossfade between denoised chunks. |
 | `--normalize` | off | Two-pass loudness normalisation of the **cleaned** audio. |
-| `--target_lufs` | `-16` | Target integrated loudness for `--normalize`. |
+| `--target_lufs` | `-16` | Loudness target for `--normalize`, or `auto` (see below; default with `--autotune`). |
 | `--audio_gain` | off | Extra gain after denoising (`6dB`, `2.0`), then limited. |
 | `--reduce_hiss` | off | Extra pass to reduce steady background hiss. See below. |
 | `--hiss_method` | `profile` | `profile` (learned noise fingerprint) or `patch`. |
@@ -163,6 +164,8 @@ constant:
 |------|---------|-------------|
 | `--target_tp` | `-1.5` | True-peak ceiling for `--normalize`, dBTP. |
 | `--target_lra` | `11` | Loudness range target for `--normalize`, LU. |
+| `--target_lufs_max` | `-16` | Loudest target `--target_lufs auto` may choose. |
+| `--target_lufs_min` | `-24` | Quietest target `auto` may choose; below it, gentle compression is accepted. |
 | `--limiter_ceiling` | `0.97` | Limiter ceiling after `--audio_gain` and the music mix (linear). |
 | `--silence_warn_lufs` | `-45` | Warn when the cleaned audio is this quiet before normalising. |
 | `--loudness_tolerance_db` | `2` | Warn when the result lands this far from `--target_lufs`. |
@@ -309,13 +312,26 @@ scan reading the magnetic stripe directly avoids it at the source.
 
 ### A note on `--normalize` and loudness
 
-The tool reports the loudness it actually measured on the result, e.g.
-`Final audio: -16.1 LUFS, true peak -5.6 dBTP (target -16)`, measured at the end of
-the render — after the music bed and declick, on the audio you get. `loudnorm` caps its own gain to keep the
-true peak under −1.5 dBTP, so quiet, peaky material can land short of the target — the
-tool warns when it is more than 2 dB off. That behaviour is deliberate: staying below the
-peak ceiling matters more than hitting a loudness number. Use `--audio_gain` if you need
-a further, limited boost.
+`loudnorm` reaches the target in one of two ways, and the tool reports which it used:
+
+- **linear** — a plain volume change; the dynamics are untouched;
+- **dynamic** — used when the gain needed would push peaks over the true-peak ceiling
+  (`--target_tp`, −1.5 dBTP). It compresses: quiet passages come up relative to loud ones.
+
+Quiet tape usually needs dynamic mode at the default −16 LUFS: one window of home video
+needed +32.6 dB of gain, which would have put peaks 7.6 dB over the ceiling. Dynamic mode
+makes speech more even; it also changes the dynamics of the voices (on that window,
+speech fidelity fell from 0.971 to 0.926 just from normalising).
+
+**`--target_lufs auto`** picks the loudest target a plain volume change can reach —
+where the peaks meet the ceiling — capped at `--target_lufs_max` (−16) and no quieter
+than `--target_lufs_min` (−24). It also raises the loudness-range target to the
+recording's own range, the other thing that makes `loudnorm` compress. On the window
+above it chose −24 LUFS, `loudnorm` stayed linear, and fidelity stayed at 0.971.
+The trade-off is level: such tape comes out quieter than −16. `--autotune` uses `auto`
+unless you set `--target_lufs` yourself, and tuning plans use it too.
+The figure reported at the end (`Final audio: …`) is measured on the final audio either
+way, and the mode is recorded in the output's `.params.json`.
 
 ### Audition before committing: `--compare`
 
@@ -362,6 +378,147 @@ re-encoded (slower, no longer bit-identical) in exchange.
 Ctrl+C at any point removes all temporary files, kills the child ffmpeg/Demucs
 processes, and deletes any partially written output — the output directory never
 contains a half-finished file. The tool exits with code 130.
+
+## Automatic settings: `--autotune`
+
+Add `--autotune` and the tool chooses the attenuation, hiss reduction and declick for
+the window itself:
+
+```bash
+./venv/bin/clean-audio "/path/video.mp4" --output_dir ~/cleaned --skip_first_n_sec 7m --process_n_seconds 1m --normalize --autotune
+```
+
+It tries a grid of settings on the window (36 by default, including two declick
+strengths), scores each against the untouched source, and renders with the best. With `--normalize` it also picks the
+loudness target automatically (`--target_lufs auto`, below), so the voices' dynamics are
+left alone. The rules are the same as
+`clean-audio-tune`'s, described below. Your other options (`--normalize`, `--target_lufs`,
+`--separate_music`, `--precise_cut`, …) apply as usual. Passing one of the settings
+autotune chooses (`--atten_lim_db`, `--reduce_hiss`, `--hiss_method`, `--hiss_nr`,
+`--hiss_strength`, `--declick`, `--declick_nr`) together with `--autotune` is an error, so it can never
+silently override you.
+
+**Digital recordings: `--source digital`.** Hiss reduction and declick are tape fixes.
+On a camera or phone video the quiet between words is room tone and reverb, not hiss,
+and the tick counter picks up consonants and music beats. The scores reward removing
+all of that, so on a wedding video autotune chose a strong declick that audibly hurt
+the voices. `--source digital` tunes only the attenuation (and, with `--separate_music`,
+the music bed); hiss reduction and declick stay off; `--source tape` tunes them too. Without the flag,
+autotune asks which one (and refuses when there is no terminal to ask on). It is
+needed because no measurement tried could tell the two apart. `clean-audio-tune` and
+`clean-audio-batch` take the same flag.
+
+Tuning costs roughly 0.8 s per second of audio, about 50 s for a 1-minute window (about 1 s per second with `--separate_music`). The
+results are cached per video in `OUTPUT_DIR/_tuning/<video name>/` (or `--autotune_dir`),
+the same cache `clean-audio-tune` and `clean-audio-batch` use. A window tuned by any of
+the three is never tuned again; a cached window is matched by its start and end, however
+it was written. Autotuning the same window again is instant.
+
+The output's `.params.json` records the settings autotune chose as plain parameters, so
+its `reproduce` command renders the same file without tuning again, and an `autotune`
+section holds the scores and whether the cache was used.
+
+## Finding the best settings: `clean-audio-tune` and `clean-audio-batch`
+
+Different stretches of the same recording often want different settings. Instead of
+guessing, let the tuner try a grid of settings on each window and score them:
+
+```bash
+./venv/bin/clean-audio-tune "/path/video.mp4" 07m00s-08m00s 1h05m-1h05m25s --out_dir ~/tuning
+```
+
+Windows can be `START-END` times or old output filenames that contain one; for many
+windows put them one per line in a file and pass `--windows_file`. For every window it
+extracts the audio once, runs DeepFilterNet once per attenuation level, renders every
+combination of hiss and declick settings, and measures each against the untouched source.
+It writes:
+
+- `report.md` — every candidate's numbers per window, the pick marked ★;
+- `listen/<window>.wav` — source → picked → runner-up, loudness-matched, with short gaps.
+  **Listen to these.** The numbers guide; your ears decide;
+- `plan.json` — the picked flags per window.
+
+Tuning is slow (about 15 minutes for 10 minutes of audio on the default grid), so it is
+never repeated needlessly. `plan.json` is saved after every window, so an interrupted
+run keeps what it finished. Rerunning with the same `--out_dir` keeps every window
+already measured — same video and grid — and measures only new ones. Add a window next
+month and only that window is tuned. Changing just the scoring criteria re-scores the
+saved measurements instantly, without rendering anything. `--retune` redoes everything,
+and so does changing the grid. If a re-score changes a window's pick, the report says
+its listening file still holds the earlier pick.
+
+How it picks: each window is judged on its own terms, because a tape that is noisy
+throughout can never reach an absolute fidelity bar. A candidate qualifies when it loses
+at most `--fidelity_tolerance` (0.03) speech fidelity against the window's *gentlest*
+candidate and has at most `--max_warble_increase` (0.5) more warble than its
+*least-warbly* one. Among those it maximises *dB of hiss removed + `--click_weight`
+(0.5) × dB of ticks removed*. `--min_fidelity` adds an absolute floor if you want one.
+
+Candidates are measured **before** loudness normalisation. On quiet tape `--normalize`
+compresses the dynamics (see *A note on `--normalize` and loudness*), and cleaner audio
+needs more gain so it is compressed harder, which would bias the scoring against hiss
+reduction. Normalisation is still applied to the final render: the plan's flags include
+`--normalize` unless you pass `--no_normalize`, and `--target_lufs` sets its target.
+
+The grid is set with `--atten` (default `10,20,30`), `--hiss`
+(`off,profile:12,profile:20,patch:0.0003`) and `--declick` (`off,12,20`: off, or
+strengths in dB as for `--declick_nr`); add `--separate_music` for recordings with music.
+
+The warble yardstick is the least-warbly candidate *among those that keep the voices*
+(pass the fidelity test). A heavy setting that is calm only because it flattened the
+speech does not set the bar for the others.
+
+With `--separate_music` the tuner first picks the **music bed level**. Speech that
+Demucs has separated warbles audibly on its own: where it cut the music out it leaves a
+watery residue, heard as echo and a changed voice. A quiet bed of the music masks it.
+The tuner takes the quietest bed from `--music_levels` (`off,-30,-25,-20,-15,-10`) whose
+speech + bed mix warbles at most `--max_music_warble_increase` (2) above the original.
+On a modern wedding video with loud music that was −15 dB; on the Super-8 wedding −30 dB.
+Candidates are then rendered with that bed and scored against speech + bed, which is
+what you will hear. `clean-audio --autotune --separate_music` applies the chosen level;
+give `--music_level_db` yourself to fix it instead (`off` drops the music, residue and all).
+
+Music is not detected automatically. On the tapes it was tried on, neither the music
+stem's level nor its tonality told the wedding (with music) apart from the chats without
+it, so pass `--separate_music` yourself when you hear music.
+
+Then render with the tuned settings — tuning has already run, so pass its plan:
+
+```bash
+./venv/bin/clean-audio-batch ~/tuning/plan.json --output_dir ~/cleaned
+```
+
+Or do both in one command. Batch looks for tuning of this exact video and these windows
+in `--tune_dir` (default `OUTPUT_DIR/_tuning/<video name>`), reuses it if found and complete, and only
+tunes when it isn't (or when you pass `--retune`):
+
+```bash
+./venv/bin/clean-audio-batch --video "/path/video.mp4" --windows_file windows.txt --output_dir ~/cleaned
+```
+
+Either way it first prints which plan it is using, when that was tuned, the criteria, and
+the settings per window (flagging windows where no candidate met the criteria). Each
+output's `.params.json` gets a `tuning` section naming the plan and the scores that won,
+so you can always tell a tuned output from a hand-set one.
+
+Outputs are named `<stem>_<window>.mp4`, where the stem comes from `clean-audio-tune
+--stem` (default: the video's file name) and the window label is kept as you wrote it.
+It prints every command line it will run before starting the first one (`--dry-run`
+prints them and stops), skips outputs that already exist (`--force` redoes them),
+renders a subset with `--only 07m00s-08m00s`, and stops the whole batch on Ctrl+C. To
+change a window's settings, edit its `flags` in `plan.json` — the file is plain JSON.
+
+## The parameters file next to every output
+
+Every output gets a `<name>.params.json` beside it, recording exactly how it was made:
+
+- `parameters` — every option, **including the defaults in force at the time**, so a
+  later change of defaults can't make an old file's processing ambiguous;
+- `reproduce` — a command with every option spelled out that renders the same file again;
+- `window` — the requested start and the actual cut after keyframe snapping;
+- `results` — measured loudness and true peak, and where the hiss profile was sampled;
+- `environment` — tool version and git commit (and whether the checkout had local
+  changes), Python, PyTorch, DeepFilterNet, Demucs and ffmpeg versions.
 
 ## Examples
 
