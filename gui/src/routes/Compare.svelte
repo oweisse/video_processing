@@ -1,12 +1,14 @@
 <script lang="ts">
   // Original vs cleaned, one picture, instant gapless switching (docs/gui-design.md §6.2).
   import { onDestroy } from "svelte";
+  import { ltr } from "../lib/bidi";
   import { api, media, type Output } from "../lib/api";
   import { ABPlayer } from "../lib/abplayer";
   import { audioContext, decode, type Decoded } from "../lib/audio";
-  import { href } from "../lib/router.svelte";
+  import { links } from "../lib/router.svelte";
   import { findOutput, reportError, store } from "../lib/state.svelte";
   import { formatClock } from "../lib/time";
+  import { followClock } from "../lib/videosync";
   import ABDeck from "../components/ABDeck.svelte";
 
   let { file }: { file: string } = $props();
@@ -60,29 +62,8 @@
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
   });
 
-  // The picture follows the audio clock: small drift is absorbed by nudging the
-  // playback rate, large drift (after a seek) by jumping.
-  // What is heard lags the audio clock by the output latency; the picture follows what is heard.
   const ctx = audioContext();
-  function onframe(clock: number, playing: boolean) {
-    const v = video;
-    if (!v || v.readyState < 2) return;
-    const t = playing ? Math.max(0, clock - (ctx.outputLatency || ctx.baseLatency || 0)) : clock;
-    const drift = v.currentTime - t;
-    v.dataset.drift = drift.toFixed(3); // for checking sync from the console
-    if (playing) {
-      if (v.paused) void v.play().catch(() => {});
-      if (Math.abs(drift) > 0.5) {
-        if (!v.seeking) v.currentTime = t;
-        v.playbackRate = 1;
-      } else if (Math.abs(drift) > 0.04) {
-        v.playbackRate = Math.max(0.9, Math.min(1.1, 1 - drift));
-      } else if (Math.abs(drift) < 0.015) v.playbackRate = 1;
-    } else {
-      if (!v.paused) v.pause();
-      if (Math.abs(drift) > 0.02 && !v.seeking) v.currentTime = t;
-    }
-  }
+  const onframe = (clock: number, playing: boolean) => followClock(video, ctx, clock, playing);
 
   const fps = $derived(source?.probe?.video?.fps ?? 30);
 
@@ -113,10 +94,6 @@
   {:else if !output}
     <div class="error-box">No output named {file} in this project.</div>
   {:else}
-    <div class="row">
-      <a href={href([])}>Library</a><span class="faint">/</span>
-      <h1 class="ellipsis">{output.file}</h1>
-    </div>
     <div class="layout">
       <div class="col main">
         {#if output.kind === "video"}
@@ -125,7 +102,8 @@
         {/if}
         {#if error}<div class="error-box">{error}</div>{/if}
         <ABDeck {player} {a} {b} {fps} bind:levelMatch
-                labelB={bOutput && bOutput.file !== output.file ? bOutput.tag ?? "Other" : "Cleaned"} {onframe} />
+                labelB={bOutput && bOutput.file !== output.file ? bOutput.tag ?? "Other" : "Cleaned"} {onframe}
+                picture={source ? { source, start: output.window?.actual_start_sec ?? 0 } : null} />
       </div>
 
       <aside class="col">
@@ -138,7 +116,7 @@
           {#if alternatives.length > 1}
             <label class="col small">B side
               <select bind:value={bFile}>
-                {#each alternatives as o (o.file)}<option value={o.file}>{o.tag ?? "(no tag)"} — {o.file}</option>{/each}
+                {#each alternatives as o (o.file)}<option value={o.file}>{o.tag ?? "(no tag)"} — {ltr(o.file)}</option>{/each}
               </select>
             </label>
           {/if}
@@ -164,10 +142,10 @@
           {/if}
           <div class="row wrap">
             {#if plan && planWindow}
-              <a href={href(["candidates", plan.path, planWindow.label], { b: output.file })}><button>Candidates for this window</button></a>
+              <a href={links.candidates(plan.path, planWindow.label, { b: output.file })}><button>Candidates for this window</button></a>
             {/if}
             {#if source}
-              <a href={href(["new"], { source: source.id, start: output.window?.requested_start_sec ?? 0,
+              <a href={links.newRun({ source: source.id, start: output.window?.requested_start_sec ?? 0,
                   duration: output.window?.requested_duration_sec ?? "", kind: output.params?.source ?? source.source_kind ?? "",
                   music: output.params?.separate_music ? 1 : "" })}><button>Re-run…</button></a>
             {/if}
@@ -189,7 +167,8 @@
 
 <style>
   .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; align-items: start; }
-  video { width: 100%; max-height: 58vh; background: #000; border-radius: var(--radius); }
+  /* Leave room for the A/B deck under it inside the fixed workspace. */
+  video { width: 100%; max-height: max(200px, calc(100vh - 470px)); background: #000; border-radius: var(--radius); }
   .small { font-size: 12.5px; }
   .wrap { flex-wrap: wrap; }
   .cmd { display: block; max-height: 160px; overflow: auto; word-break: break-all; color: var(--text-dim); }

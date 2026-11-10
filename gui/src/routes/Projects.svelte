@@ -1,6 +1,7 @@
 <script lang="ts">
   // Edit projects in this output folder: open, create, delete.
   import { api } from "../lib/api";
+  import { ltr } from "../lib/bidi";
   import { go, href } from "../lib/router.svelte";
   import { loadLibrary, reportError, store } from "../lib/state.svelte";
   import { formatDuration } from "../lib/time";
@@ -40,7 +41,7 @@
     </form>
     {#each store.library.projects ?? [] as p (p.path)}
       <div class="card row">
-        <a href={href(["edit", p.name])}><h2>{p.name}</h2></a>
+        <a href={href(["edit", p.name])}><h2>{ltr(p.name)}</h2></a>
         <span class="dim small">{p.clips} clip{p.clips === 1 ? "" : "s"} · {formatDuration(p.duration_sec)}</span>
         {#if p.exported}
           <span class="chip done" title={p.export_path}>exported</span>

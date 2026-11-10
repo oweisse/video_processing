@@ -1,11 +1,26 @@
 <script lang="ts">
   // Queue and history: live progress, cancel, logs, and where the result went (§6.5).
+  // Shown in the Jobs drawer; `filter` narrows it (Deliver shows only renders).
   import { api, type Job } from "../lib/api";
-  import { href } from "../lib/router.svelte";
+  import { links } from "../lib/router.svelte";
+  import Icon from "./Icon.svelte";
   import { reportError, store } from "../lib/state.svelte";
   import { formatDuration } from "../lib/time";
 
+  let { filter }: { filter?: (j: Job) => boolean } = $props();
+
   let open = $state<Record<string, boolean>>({});
+  const shown = $derived(filter ? store.jobs.filter(filter) : store.jobs);
+  const finished = $derived(shown.filter((j) => j.state !== "running" && j.state !== "queued"));
+  async function clear() {
+    try {
+      // A filtered list (Deliver's renders) clears only what it shows.
+      if (filter) for (const j of finished) await api.removeJob(j.id);
+      else await api.clearJobs();
+    } catch (e) {
+      reportError(e);
+    }
+  }
   let logs = $state<Record<string, string>>({});
 
   function elapsed(j: Job, clock: number) {
@@ -48,10 +63,16 @@
   const copy = (text: string) => navigator.clipboard.writeText(text);
 </script>
 
-<div class="page col">
-  <div class="row"><h1>Jobs</h1><span class="spacer"></span>
-    {#if !store.connected}<span class="warn small">reconnecting to the server…</span>{/if}</div>
-  {#each store.jobs as j (j.id)}
+<div class="col list">
+  {#if !store.connected}<span class="warn small">Reconnecting to the server…</span>{/if}
+  {#if finished.length}
+    <div class="row head">
+      <span class="faint small">{shown.length - finished.length} waiting or running · {finished.length} finished</span>
+      <span class="spacer"></span>
+      <button class="small" onclick={clear}>Clear finished</button>
+    </div>
+  {/if}
+  {#each shown as j (j.id)}
     {@const f = fraction(j)}
     {@const secs = elapsed(j, now)}
     <div class="card col job">
@@ -60,15 +81,21 @@
         <button class="link title ellipsis" onclick={() => (open[j.id] = !open[j.id])}>{j.title}</button>
         <span class="spacer"></span>
         {#if secs !== null}<span class="faint small">{formatDuration(secs)}</span>{/if}
-        {#if j.state === "running" || j.state === "queued"}
+        {#if j.state === "running"}
           <button class="small danger" disabled={j.cancel_requested} onclick={() => api.cancel(j.id).catch(reportError)}>Cancel</button>
+        {:else if j.state === "queued"}
+          <button class="small danger" title="Take it off the queue" onclick={() => api.removeJob(j.id).catch(reportError)}>Remove</button>
         {:else}
           <button class="small" onclick={() => api.retry(j.id).catch(reportError)}>Run again</button>
         {/if}
         {#if j.state === "done" && j.type === "export" && j.result?.output}
           <button class="small" onclick={() => api.reveal(j.result!.output).catch(reportError)}>Reveal</button>
         {:else if j.state === "done" && outputName(j)}
-          <a href={href(["compare", outputName(j)!])}><button class="small primary">Compare</button></a>
+          <a href={links.output(outputName(j)!)}><button class="small primary">Compare</button></a>
+        {/if}
+        {#if j.state !== "running" && j.state !== "queued"}
+          <button class="icon ghost" title="Remove from the list" aria-label="Remove from the list"
+                  onclick={() => api.removeJob(j.id).catch(reportError)}><Icon name="x" size={14} /></button>
         {/if}
       </div>
       {#if j.state === "running"}
@@ -95,12 +122,14 @@
       {/if}
     </div>
   {:else}
-    <div class="card dim">No jobs yet.</div>
+    <div class="dim empty">No jobs yet.</div>
   {/each}
 </div>
 
 <style>
-  .job { gap: 6px; padding: 10px 14px; }
+  .list { gap: 6px; }
+  .job { gap: 6px; padding: 8px 12px; }
+  .empty { padding: 12px; }
   .title { color: var(--text); font-weight: 500; text-align: left; max-width: 70%; }
   .small { font-size: 12.5px; }
   .grow { flex: 1; }

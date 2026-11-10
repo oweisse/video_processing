@@ -389,6 +389,19 @@ def create_app(output_dir=None, dialogs=None):
         except KeyError:
             raise HTTPException(404, "Unknown job")
 
+    @app.post("/api/jobs/clear")
+    async def clear_jobs():
+        return {"removed": await queue.clear_finished(lib().output_dir)}
+
+    @app.post("/api/jobs/{job_id}/remove")
+    async def remove_job(job_id: str):
+        try:
+            return {"removed": await queue.remove(job_id)}
+        except KeyError:
+            raise HTTPException(404, "Unknown job")
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+
     @app.post("/api/jobs/{job_id}/retry")
     def retry_job(job_id: str):
         job = queue.jobs.get(job_id)
@@ -514,7 +527,9 @@ def create_app(output_dir=None, dialogs=None):
         return FileResponse(path)
 
     @app.get("/media/poster")
-    async def media_poster(source: str, i: int = Query(0, ge=0, lt=media.POSTER_FRAMES)):
+    async def media_poster(source: str, i: int = Query(0, ge=0), n: int = media.POSTER_FRAMES):
+        if n not in media.POSTER_SETS or i >= n:
+            raise HTTPException(422, f"n must be one of {sorted(media.POSTER_SETS)} and i below n")
         src = _source(source)
         probe = src.get("probe")
         if not probe:
@@ -527,7 +542,30 @@ def create_app(output_dir=None, dialogs=None):
             raise HTTPException(404, "The source has no picture")
         try:
             path = await media.poster(lib().output_dir, src["path"], src["id"], i,
-                                      probe.get("duration_sec"))
+                                      probe.get("duration_sec"), n)
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc))
+        return FileResponse(path, media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=86400"})
+
+    @app.get("/media/frame")
+    async def media_frame(source: str, t: float = Query(0.0, ge=0), w: int = media.FRAME_WIDTHS[0]):
+        if w not in media.FRAME_WIDTHS:
+            raise HTTPException(422, f"w must be one of {list(media.FRAME_WIDTHS)}")
+        src = _source(source)
+        probe = src.get("probe")
+        if not probe:
+            try:
+                probe = await asyncio.to_thread(library_mod.probe_source, lib().output_dir, src)
+            except RuntimeError as exc:
+                raise HTTPException(422, str(exc))
+            src["probe"] = probe
+        if not probe.get("video"):
+            raise HTTPException(404, "The source has no picture")
+        duration = probe.get("duration_sec") or 0.0
+        at = min(t, max(0.0, duration - 0.2))      # a frame exists just before the end
+        try:
+            path = await media.frame(lib().output_dir, src["path"], src["id"], at, w)
         except RuntimeError as exc:
             raise HTTPException(500, str(exc))
         return FileResponse(path, media_type="image/jpeg",

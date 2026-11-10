@@ -121,6 +121,38 @@ class JobQueue:
                 continue
         return job
 
+    async def remove(self, job_id):
+        """Take a job off the list: a waiting one is cancelled first, a running one must be
+        cancelled (and finish) before it can go. Its record and log are deleted."""
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job["state"] == "running":
+            raise RuntimeError("Cancel the job first; it is still running.")
+        if job["state"] == "queued":
+            await self.cancel(job_id)
+        del self.jobs[job_id]
+        folder = jobs_dir(job["output_dir"])
+        for path in (folder / f"{job_id}.json", Path(job.get("log") or folder / f"{job_id}.log")):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait({"id": job_id, "removed": True})
+            except asyncio.QueueFull:
+                pass
+        return job_id
+
+    async def clear_finished(self, output_dir):
+        """Remove every finished job (done, failed, cancelled, lost) of a project."""
+        done = [j["id"] for j in self.jobs.values()
+                if j["output_dir"] == str(output_dir) and j["state"] not in ACTIVE]
+        for job_id in done:
+            await self.remove(job_id)
+        return done
+
     def subscribe(self):
         q = asyncio.Queue(maxsize=1000)
         self._subscribers.add(q)

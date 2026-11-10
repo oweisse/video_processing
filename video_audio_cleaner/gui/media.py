@@ -77,20 +77,36 @@ async def original_audio(output_dir, source_path, start_sec, duration_sec):
 
 POSTER_FRAMES = 4          # frames per source, spread across it
 POSTER_WIDTH = 320
+SCRUB_FRAMES = 12          # the denser set the Media grid shows while hovering a card
+SCRUB_WIDTH = 240
+POSTER_SETS = {POSTER_FRAMES: POSTER_WIDTH, SCRUB_FRAMES: SCRUB_WIDTH}
 
 
-def poster_at(duration, index):
-    """Where frame `index` is taken: evenly inside the video, avoiding the very ends."""
-    return max(0.0, (duration or 0.0) * (index + 0.5) / POSTER_FRAMES)
+def poster_at(duration, index, frames=POSTER_FRAMES):
+    """Where frame `index` of `frames` is taken: evenly inside the video, avoiding the very ends."""
+    return max(0.0, (duration or 0.0) * (index + 0.5) / frames)
 
 
-async def poster(output_dir, source_path, source_id, index, duration):
-    """A JPEG of the source at poster_at(duration, index), cached per source."""
-    dst = Path(output_dir) / "_gui" / "cache" / "posters" / f"{source_id}_{index}.jpg"
-    at = poster_at(duration, index)
+async def poster(output_dir, source_path, source_id, index, duration, frames=POSTER_FRAMES):
+    """A JPEG of the source at poster_at(duration, index, frames), cached per source."""
+    name = f"{source_id}_{index}" if frames == POSTER_FRAMES else f"{source_id}_{frames}_{index}"
+    dst = Path(output_dir) / "_gui" / "cache" / "posters" / f"{name}.jpg"
+    at = poster_at(duration, index, frames)
     return await _cached(dst, lambda d: _ffmpeg(
         ["-ss", f"{at:.3f}", "-i", str(source_path), "-map", "0:v:0", "-frames:v", "1",
-         "-vf", f"scale={POSTER_WIDTH}:-2", "-q:v", "4"], d))
+         "-vf", f"scale={POSTER_SETS[frames]}:-2", "-q:v", "4"], d))
+
+
+FRAME_WIDTHS = (160, 320)  # filmstrips under piece bars, hover previews
+
+
+async def frame(output_dir, source_path, source_id, at, width=FRAME_WIDTHS[0]):
+    """A JPEG of the source at `at` seconds (to 0.1 s), cached per source, time and width."""
+    tenths = max(0, round(at * 10))
+    dst = Path(output_dir) / "_gui" / "cache" / "frames" / f"{source_id}_{tenths}_{width}.jpg"
+    return await _cached(dst, lambda d: _ffmpeg(
+        ["-ss", f"{tenths / 10:.1f}", "-i", str(source_path), "-map", "0:v:0", "-frames:v", "1",
+         "-vf", f"scale={width}:-2", "-q:v", "5"], d))
 
 
 def cache_size(output_dir):

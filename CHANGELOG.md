@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+**Changed**
+- GUI: a full-window workspace layout (`docs/gui-editor-redesign.md`, phase A). Four
+  workspaces switched from a bar at the bottom (⇧1–⇧4): **Media** (bins, a poster grid
+  that scrubs through each video under the mouse, a details panel with the video's
+  facts, cleaned windows, tuning and editing state), **Enhance** (compare, candidates,
+  new clean), **Edit** and **Deliver** (timelines and the render queue). Jobs open in a
+  drawer from the bar. Resizable panels remember their sizes. Dark theme only. Old links
+  (`#/compare/…`, `#/candidates/…`, `#/new`, `#/jobs`) still work.
+- GUI Enhance: every video and its pieces (cleaned windows and tuned windows) in a tree
+  on the left, a breadcrumb back to the video and to all videos, `[`/`]` to step
+  between a video's pieces and `{`/`}` between videos. Under the player, the whole video
+  as a filmstrip with its pieces on it; hover one to see a frame from it, click to open
+  it, drag across the bar to clean a new range. Media's details panel uses the same bar.
+  Compare and Candidates show the clip's frames above the A/B waveforms, with the
+  playhead through them; click the frames to seek. Switching to another version of the
+  same stretch (or any piece that covers the moment) carries on from the same point in
+  the video, on the same A/B side, still playing if it was.
+- GUI Enhance, a video's own page: the whole original video in a player (the editing
+  copy when prepared, else the file), with play, ±10 s and frame steps. On the bar below,
+  a click jumps and a click-and-drag chooses a span (the player follows the mouse, so
+  each edge can be placed by eye); `I`/`O` mark a span at the playhead. *Clean this
+  span…* (`Enter`) opens the clean form with it.
+  Clicking the bar on a piece's page opens the whole video at that moment.
+- GUI: file names mixing Hebrew (or Arabic) with digits display in their real order
+  (e.g. an output name no longer reads "02-04_חתונהm37s…").
+- GUI Candidates: the video plays in sync while you listen, large above the waveforms
+  (the editing copy when prepared, else the file), and `↑`/`↓` flip to the previous/next
+  candidate in table order without stopping playback. The card on the right shows the
+  candidate being heard: its settings, measurements and verdict.
+- GUI jobs: a waiting job can be removed from the queue, finished ones removed one by one
+  or with *Clear finished* (new `POST /api/jobs/{id}/remove` and `/api/jobs/clear`).
+  "Queued" messages have a *Show queue* button.
+- GUI Candidates: the candidate card shows its render while it waits or runs (progress,
+  Show queue, Cancel/Remove), and a candidate that already has an output says so and
+  links to it instead of rendering it again (*Render it again anyway…* is still there).
+  Rendered candidates are marked in the table.
+- GUI: preparing a video for editing can be cancelled where its progress is shown
+  (Media and Enhance details, the editor).
+- `/media/poster` takes `n=12` for the hover-scrub frames; new `/media/frame` for a
+  frame at any time; the library lists exports.
+
 ## 0.5.0
 
 **Added**

@@ -126,9 +126,19 @@ export interface ExportPlan {
   output_exists: boolean;
 }
 
+export interface ExportFile {
+  file: string;
+  path: string;
+  exists: boolean;
+  size: number | null;
+  created: string | null;
+  project: string | null;
+}
+
 export interface Library {
   output_dir: string | null;
   projects?: ProjectSummary[];
+  exports?: ExportFile[];
   sources: Source[];
   unknown: Output[];
   recent_output_dirs: string[];
@@ -246,10 +256,14 @@ export const api = {
   submit: (req: object) => call<Job>("POST", "/api/jobs", req),
   cancel: (id: string) => call<Job>("DELETE", `/api/jobs/${id}`),
   retry: (id: string) => call<Job>("POST", `/api/jobs/${id}/retry`),
+  removeJob: (id: string) => call<{ removed: string }>("POST", `/api/jobs/${id}/remove`),
+  clearJobs: () => call<{ removed: string[] }>("POST", "/api/jobs/clear"),
 };
 
 export const media = {
   file: (path: string) => `/media/file?${q({ path })}`,
+  /** A frame of a source at `t` seconds (the server keeps it to 0.1 s). */
+  frame: (source: string, t: number, w: 160 | 320 = 160) => `/media/frame?${q({ source, t: Math.round(t * 10) / 10, w })}`,
   outputAudio: (file: string) => `/media/audio?${q({ kind: "output", file })}`,
   originalFor: (file: string) => `/media/audio?${q({ kind: "original_for", file })}`,
   original: (source: string, start: number, duration: number | null) =>

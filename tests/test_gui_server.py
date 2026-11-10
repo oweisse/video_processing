@@ -231,6 +231,23 @@ def test_ml_jobs_run_one_at_a_time(client):
     assert wait_for(client, second)["state"] == "done"
 
 
+def test_jobs_can_be_removed(client, project):
+    first = submit_fake(client, "slow")
+    waiting = submit_fake(client, "ok")
+    wait_for(client, first, states=("running",))
+    # A running job must be cancelled first; a waiting one is cancelled and removed.
+    assert client.post(f"/api/jobs/{first}/remove", headers=H).status_code == 409
+    assert client.post(f"/api/jobs/{waiting}/remove", headers=H).json() == {"removed": waiting}
+    assert client.get(f"/api/jobs/{waiting}", headers=H).status_code == 404
+    assert not (project / "_gui" / "jobs" / f"{waiting}.json").exists()
+    client.delete(f"/api/jobs/{first}", headers=H)
+    wait_for(client, first)
+    done = wait_for(client, submit_fake(client, "ok"))["id"]
+    removed = client.post("/api/jobs/clear", headers=H).json()["removed"]
+    assert set(removed) >= {first, done}
+    assert client.get("/api/jobs", headers=H).json() == []
+
+
 def test_unfinished_jobs_are_marked_lost_after_a_restart(project):
     folder = project / "_gui" / "jobs"
     folder.mkdir(parents=True)
@@ -368,6 +385,17 @@ def test_exports_are_not_listed_as_stray_files(client, project):
     (project / "Cut.params.json").write_text(json.dumps({"kind": "export", "output": "Cut.mp4"}))
     lib = client.post("/api/library/rescan", headers=H).json()
     assert [o["file"] for o in lib["unknown"]] == ["stray.mp4"]
+    assert [(e["file"], e["exists"], e["size"]) for e in lib["exports"]] == [("Cut.mp4", True, 1)]
+
+
+def test_source_frames(client, project):
+    sid = client.get("/api/library", headers=H).json()["sources"][0]["id"]
+    r = client.get("/media/frame", params={"source": sid, "t": 3.14})
+    assert r.status_code == 200 and r.content[:2] == b"\xff\xd8"
+    assert (project / "_gui" / "cache" / "frames" / f"{sid}_31_160.jpg").exists()
+    # Past the end: the last frame, not an error.
+    assert client.get("/media/frame", params={"source": sid, "t": 99999}).status_code == 200
+    assert client.get("/media/frame", params={"source": sid, "t": 1, "w": 100}).status_code == 422
 
 
 def test_source_posters(client, project):
@@ -376,3 +404,9 @@ def test_source_posters(client, project):
     assert r.status_code == 200 and r.content[:2] == b"\xff\xd8"
     assert (project / "_gui" / "cache" / "posters" / f"{sid}_2.jpg").exists()
     assert client.get("/media/poster", params={"source": sid, "i": 4}).status_code == 422
+    # The denser hover-scrub set, cached apart from the default four.
+    r = client.get("/media/poster", params={"source": sid, "i": 11, "n": 12})
+    assert r.status_code == 200 and r.content[:2] == b"\xff\xd8"
+    assert (project / "_gui" / "cache" / "posters" / f"{sid}_12_11.jpg").exists()
+    assert client.get("/media/poster", params={"source": sid, "i": 12, "n": 12}).status_code == 422
+    assert client.get("/media/poster", params={"source": sid, "i": 0, "n": 7}).status_code == 422

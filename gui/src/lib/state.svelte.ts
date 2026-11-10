@@ -1,5 +1,11 @@
 // App-wide state: the open project and the job list, kept live over SSE.
 import { api, type Job, type Library, type Output, type Source } from "./api";
+import { shell } from "./router.svelte";
+
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
 
 export const store = $state({
   native: false,
@@ -8,16 +14,21 @@ export const store = $state({
   jobs: [] as Job[],
   connected: false,
   error: null as string | null,
-  toasts: [] as { id: number; text: string; level: "info" | "error" }[],
+  toasts: [] as { id: number; text: string; level: "info" | "error"; action?: ToastAction }[],
 });
 
 let toastId = 0;
-export function toast(text: string, level: "info" | "error" = "info") {
+export function toast(text: string, level: "info" | "error" = "info", action?: ToastAction) {
   const id = ++toastId;
-  store.toasts.push({ id, text, level });
+  store.toasts.push({ id, text, level, action });
   setTimeout(() => {
     store.toasts = store.toasts.filter((t) => t.id !== id);
-  }, level === "error" ? 8000 : 4000);
+  }, level === "error" || action ? 8000 : 4000);
+}
+
+/** Tell the user a job was queued, with a way to see the queue. */
+export function queued(job: Job) {
+  toast(`Queued: ${job.title}`, "info", { label: "Show queue", run: () => (shell.jobsOpen = true) });
 }
 
 export function reportError(e: unknown) {
@@ -43,7 +54,11 @@ export async function loadJobs() {
 
 const FINISHED = new Set(["done", "failed", "cancelled", "lost"]);
 
-function upsert(job: Job) {
+function upsert(job: Job | { id: string; removed: true }) {
+  if ("removed" in job) {
+    store.jobs = store.jobs.filter((j) => j.id !== job.id);
+    return;
+  }
   const i = store.jobs.findIndex((j) => j.id === job.id);
   const before = i >= 0 ? store.jobs[i] : null;
   if (i >= 0) store.jobs[i] = { ...store.jobs[i], ...job };

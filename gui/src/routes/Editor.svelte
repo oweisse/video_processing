@@ -2,6 +2,7 @@
   // The editor (docs/gui-design.md §8-§10): pick ranges from prepared sources, arrange
   // them on the timeline, lay music under them, export one MP4.
   import { onDestroy } from "svelte";
+  import { ltr } from "../lib/bidi";
   import { api, media, type ExportPlan, type Source } from "../lib/api";
   import { audioContext } from "../lib/audio";
   import {
@@ -9,8 +10,8 @@
     type Clip, type MusicClip, type Project,
   } from "../lib/edit";
   import { Program } from "../lib/program";
-  import { go, href } from "../lib/router.svelte";
-  import { nativePick, reportError, store, toast } from "../lib/state.svelte";
+  import { go, href, links } from "../lib/router.svelte";
+  import { nativePick, reportError, store, toast, queued } from "../lib/state.svelte";
   import { formatClock, formatDuration } from "../lib/time";
   import FolderBrowser from "../components/FolderBrowser.svelte";
   import Timeline, { type Selection, type ThumbInfo } from "../components/Timeline.svelte";
@@ -322,7 +323,7 @@
     await flush();
     try {
       const job = await api.submit({ type: "export", project: name });
-      toast(`Queued: ${job.title}`);
+      queued(job);
       exporting = false;
     } catch (e) {
       reportError(e);
@@ -400,7 +401,7 @@
   {:else}
     <div class="row">
       <a href={href(["edit"])}>Edit</a><span class="faint">/</span>
-      <h1>{project.name}</h1>
+      <h1>{ltr(project.name)}</h1>
       <span class="dim">{project.tracks.video.length} clips · {formatDuration(total)}</span>
       <span class="faint small">{saving === "saving" ? "saving…" : saving === "error" ? "not saved" : "saved"}</span>
       <span class="spacer"></span>
@@ -418,7 +419,7 @@
         <div class="row">
           <h3>Source</h3>
           <select bind:value={srcId} class="grow">
-            {#each sources as s (s.id)}<option value={s.id}>{s.name}{s.prep?.proxy ? "" : " (not prepared)"}</option>{/each}
+            {#each sources as s (s.id)}<option value={s.id}>{ltr(s.name)}{s.prep?.proxy ? "" : " (not prepared)"}</option>{/each}
           </select>
         </div>
         {#if src && src.prep?.proxy}
@@ -453,11 +454,15 @@
           <div class="faint tiny">Green under the slider = cleaned outputs. Clips there play their cleaned sound.</div>
         {:else if src}
           <div class="prep col">
-            <p class="dim">{src.name} needs a 540p editing copy, thumbnails and a waveform first, so
+            <p class="dim">{ltr(src.name)} needs a 540p editing copy, thumbnails and a waveform first, so
               scrubbing is instant. They are made once and kept in <code>_gui/cache</code>.</p>
             {#if prepJob}
-              <span class="dim small">{prepJob.step?.title ?? "Waiting…"}
-                {#if prepJob.progress?.total_sec} · {Math.round((100 * prepJob.progress.processed_sec) / prepJob.progress.total_sec)}%{/if}</span>
+              <div class="row">
+                <span class="dim small">{prepJob.step?.title ?? "Waiting…"}
+                  {#if prepJob.progress?.total_sec} · {Math.round((100 * prepJob.progress.processed_sec) / prepJob.progress.total_sec)}%{/if}</span>
+                <button class="small danger" disabled={prepJob.cancel_requested}
+                        onclick={() => api.cancel(prepJob.id).catch(reportError)}>{prepJob.cancel_requested ? "Cancelling…" : "Cancel"}</button>
+              </div>
             {:else}
               <div><button class="primary" onclick={() => prepare(src)}>Prepare for editing</button></div>
             {/if}
@@ -526,7 +531,7 @@
             </select></label>
           <span class="spacer"></span>
           {#if !covering.length}
-            <a href={href(["new"], { source: c.source, start: Math.floor(c.in_sec), duration: Math.ceil(c.out_sec - Math.floor(c.in_sec)), kind: sourceById(c.source)?.source_kind ?? "" })}>
+            <a href={links.newRun({ source: c.source, start: Math.floor(c.in_sec), duration: Math.ceil(c.out_sec - Math.floor(c.in_sec)), kind: sourceById(c.source)?.source_kind ?? "" })}>
               <button class="small">Clean this range…</button></a>
           {/if}
           <button class="small danger" onclick={removeSelected}>Delete</button>
@@ -576,7 +581,7 @@
 {#if exporting && project}
   <div class="backdrop" onclick={() => (exporting = false)} role="presentation"></div>
   <div class="modal card col" role="dialog" aria-label="Export">
-    <div class="row"><h2>Export {project.name}</h2><span class="spacer"></span><button class="small" onclick={() => (exporting = false)}>✕</button></div>
+    <div class="row"><h2>Export {ltr(project.name)}</h2><span class="spacer"></span><button class="small" onclick={() => (exporting = false)}>✕</button></div>
     {#if !plan}
       <p class="dim">Checking the cuts…</p>
     {:else}
@@ -604,7 +609,7 @@
       {:else}
         <div class="dim">The picture is re-encoded: {plan.reasons.join("; ")}.</div>
       {/if}
-      <div class="dim small">{formatDuration(plan.duration)} → <span class="mono">{plan.output}</span>
+      <div class="dim small">{formatDuration(plan.duration)} → <span class="mono">{ltr(plan.output)}</span>
         {#if plan.output_exists}<span class="warn"> (exists: will be replaced)</span>{/if}</div>
       <div class="dim small">MP4 · H.264 · AAC 48 kHz stereo · ready for Google Photos and YouTube.</div>
       <div class="row"><span class="spacer"></span>

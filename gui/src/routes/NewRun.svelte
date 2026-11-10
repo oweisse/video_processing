@@ -1,8 +1,9 @@
 <script lang="ts">
   // A form over clean-audio that always shows the command it will run (docs/gui-design.md §6.4).
   import { api, type CliOption, type SourceKind } from "../lib/api";
-  import { go } from "../lib/router.svelte";
-  import { loadLibrary, nativePick, reportError, sourceById, store, toast } from "../lib/state.svelte";
+  import { ltr } from "../lib/bidi";
+  import { go, shell } from "../lib/router.svelte";
+  import { loadLibrary, nativePick, reportError, sourceById, store, toast, queued } from "../lib/state.svelte";
   import { formatDuration, parseTime } from "../lib/time";
   import FolderBrowser from "../components/FolderBrowser.svelte";
   import SourceStrip from "../components/SourceStrip.svelte";
@@ -117,10 +118,10 @@
     try {
       for (const p of parsed) {
         const job = await api.submit(request(p));
-        toast(`Queued: ${job.title}`);
+        queued(job);
       }
       if (stay) rows = [{ start: "", duration: "" }];
-      else go(["jobs"]);
+      else shell.jobsOpen = true;
     } catch (e) {
       reportError(e);
     } finally {
@@ -175,12 +176,12 @@
         <div class="row">
           <select bind:value={sourceId} class="grow">
             <option value="" disabled>Choose a video…</option>
-            {#each sources as s (s.id)}<option value={s.id}>{s.name}</option>{/each}
+            {#each sources as s (s.id)}<option value={s.id}>{ltr(s.name)}</option>{/each}
           </select>
           <button onclick={chooseFile} title="Or drop a video onto the window">Add file…</button>
         </div>
         {#if source}
-          <span class="faint mono small ellipsis">{source.path}
+          <span class="faint mono small ellipsis">{ltr(source.path)}
             {#if fileDuration} · {formatDuration(fileDuration)}{/if}</span>
           {#key source.id}<SourceStrip {source} height={64} />{/key}
         {/if}
@@ -194,7 +195,7 @@
             <input placeholder="length (to end)" bind:value={r.duration} class="time" />
             <span class="small {names[i]?.exists ? 'warn' : 'faint'} ellipsis grow">
               {#if parsed[i].error}<span class="danger">{parsed[i].error}</span>
-              {:else if names[i]?.name}→ {names[i].name}{names[i].exists ? " (exists: will be replaced)" : ""}{/if}
+              {:else if names[i]?.name}→ {ltr(names[i].name)}{names[i].exists ? " (exists: will be replaced)" : ""}{/if}
             </span>
             {#if rows.length > 1}<button class="small" onclick={() => rows.splice(i, 1)}>✕</button>{/if}
           </div>

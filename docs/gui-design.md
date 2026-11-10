@@ -1,7 +1,8 @@
 # GUI design: Video Audio Cleaner desktop app
 
 Status: **phases 1, 2 and 3 implemented** (0.5.0); phase 4 (visual edits) designed only.
-See §0 for what the implementation changed. Designed 2026-11-07. This document makes
+See §0 for what the implementation changed. The GUI is being redesigned after 0.5.0
+(`docs/gui-editor-redesign.md`); for the shell, navigation and views, that document wins. Designed 2026-11-07. This document makes
 every architectural decision so that implementation can start without further
 discussion. Where a choice was close, the alternative and the reason for the
 decision are recorded so they are not re-litigated.

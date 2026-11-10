@@ -3,7 +3,7 @@
   import type { Source } from "../lib/api";
   import { formatClock } from "../lib/time";
 
-  let { source, height = 84 }: { source: Source; height?: number } = $props();
+  let { source, height = 84, fill = false }: { source: Source; height?: number; fill?: boolean } = $props();
 
   const FRAMES = 4; // media.POSTER_FRAMES on the server
   const duration = $derived(source.probe?.duration_sec ?? null);
@@ -12,7 +12,7 @@
 </script>
 
 {#if source.exists && !failed && source.probe?.video !== null}
-  <div class="strip" style="height:{height}px">
+  <div class="strip" class:fill style={fill ? "" : `height:${height}px`}>
     {#each Array.from({ length: FRAMES }, (_, i) => i) as i}
       <img src="/media/poster?source={encodeURIComponent(source.id)}&i={i}" alt="" loading="lazy"
            title={at(i) === null ? "" : formatClock(at(i)!, false)} onerror={() => (failed = true)} />
@@ -26,4 +26,5 @@
     height: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 4px;
     background: var(--bg-sunken); border: 1px solid var(--border);
   }
+  .fill img { flex: 1 1 0; min-width: 0; height: auto; }
 </style>

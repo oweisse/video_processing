@@ -71,22 +71,28 @@ opens a window over an output folder (the folder you pass to `--output_dir`; it 
 for one the first time, then remembers the last). Everything it shows comes from the
 files the command-line tools write, so runs from the terminal appear there too.
 
-- **Library**: every source video with its outputs, grouped, with a bar showing which
-  parts of the video are cleaned, the settings each output used, and its loudness.
-- **Compare**: the output's picture with one key to flip the sound between the original
+The window has four workspaces, switched from the bar at the bottom (or `⇧1`–`⇧4`):
+**Media**, **Enhance**, **Edit** and **Deliver**. The job queue opens from the left of
+that bar.
+
+- **Media**: every source video as a poster (move the mouse across one to scrub through
+  the video), with bins for videos still to clean, cleaned ones, timelines, exports and
+  other files. The details panel shows the file, which parts are cleaned, the settings
+  each output used and its loudness. Double-click a video to open it in Enhance.
+- **Compare** (in Enhance): the output's picture with one key to flip the sound between the original
   (`A`) and the cleaned track (`B`). Both play in sync all the time, so switching is
   instant and keeps your place. Tap a key to switch, hold it to audition that side
   until you let go. Both sides play at the same loudness (*Level-match*, `M`) so the
   louder one never passes for the better one. `I`/`O` and `L` loop a stretch; ⇧-drag
   the waveform does the same.
-- **Candidates**: every setting autotune tried for a window, as a table and a
+- **Candidates** (in Enhance): every setting autotune tried for a window, as a table and a
   warble-against-hiss chart. Click one to hear it against the source; *Render this one*
   makes an output from it, *Make it the pick* makes autotune (and `clean-audio-batch`)
   use it for that window from then on.
-- **New run**: a form over `clean-audio` that always shows the exact command it will
+- **New run** (in Enhance): a form over `clean-audio` that always shows the exact command it will
   run. Several windows at once queue several runs. Autotune is on by default and keeps
   every candidate's audio for the Candidates view.
-- **Jobs**: one cleaning job runs at a time (they each want most of the machine); the
+- **Jobs** (the drawer): one cleaning job runs at a time (they each want most of the machine); the
   rest wait in the queue. Progress, cancel, logs, and *Compare* when it is done.
 
 - **Edit**: cut long videos into pieces, join pieces from several videos, and lay

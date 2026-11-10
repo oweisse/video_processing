@@ -83,7 +83,7 @@ def _window(app, url, dialogs):
     window = webview.create_window(
         "Video Audio Cleaner", url, width=bounds.get("width", 1440),
         height=bounds.get("height", 920), x=bounds.get("x"), y=bounds.get("y"),
-        min_size=(1024, 680), background_color="#111316", text_select=True)
+        min_size=(1180, 700), background_color="#1c1c1f", text_select=True)
     dialogs.window = window
 
     def remember_bounds():

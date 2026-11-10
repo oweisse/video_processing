@@ -1,6 +1,7 @@
 <script lang="ts">
   // Pick a folder or a media file inside the home folder (phase 1 has no native dialog).
   import { api, type FsList } from "../lib/api";
+  import { ltr } from "../lib/bidi";
   import { formatBytes } from "../lib/time";
 
   let {
@@ -53,11 +54,11 @@
     {#each entries as e (e.path)}
       {#if e.is_dir}
         <button class="entry" ondblclick={() => mode === "dir" && onpick(e.path)} onclick={() => open(e.path)}>
-          📁 {e.name}
+          📁 {ltr(e.name)}
         </button>
       {:else}
         <button class="entry" onclick={() => onpick(e.path)}>
-          🎞 {e.name} <span class="faint">{formatBytes(e.size)}</span>
+          🎞 {ltr(e.name)} <span class="faint">{formatBytes(e.size)}</span>
         </button>
       {/if}
     {:else}

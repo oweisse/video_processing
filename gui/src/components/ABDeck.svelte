@@ -6,6 +6,9 @@
   import { matchGains } from "../lib/loudness";
   import { peaks } from "../lib/peaks";
   import { formatClock } from "../lib/time";
+  import type { Source } from "../lib/api";
+  import Filmstrip from "./Filmstrip.svelte";
+  import { remember, resumeFor } from "../lib/playhead";
 
   let {
     player,
@@ -16,6 +19,7 @@
     fps = 30,
     levelMatch = $bindable(true),
     onframe,
+    picture = null,
   }: {
     player: ABPlayer;
     a: Decoded | null;
@@ -25,6 +29,8 @@
     fps?: number;
     levelMatch?: boolean;
     onframe?: (time: number, playing: boolean) => void;
+    /** Frames of the source along the waveform; `start` is where time 0 falls in the source. */
+    picture?: { source: Pick<Source, "id" | "probe">; start: number } | null;
   } = $props();
 
   let time = $state(0);
@@ -64,10 +70,23 @@
   let raf = 0;
   function frame() {
     time = player.time;
+    if (picture && resumed) remember(picture.source.id, picture.start + time, player.active, player.playing);
     onframe?.(time, player.playing);
     draw();
     raf = requestAnimationFrame(frame);
   }
+
+  // Opening another version of the same stretch carries on where the last one was.
+  let resumed = false;
+  $effect(() => {
+    if (resumed || !a || !b || !duration) return;
+    resumed = true;
+    const r = picture ? resumeFor(picture.source.id, picture.start, duration) : null;
+    if (!r) return;
+    player.seek(r.t);
+    player.setActive(r.side);
+    if (r.playing) void player.play();
+  });
 
   let ro: ResizeObserver;
   onMount(() => {
@@ -141,7 +160,7 @@
   function down(ev: PointerEvent) {
     if (!duration) return;
     dragging = true;
-    canvas.setPointerCapture(ev.pointerId);
+    (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
     dragFrom = timeFromEvent(ev);
     if (ev.shiftKey) {
       loopIn = dragFrom;
@@ -235,14 +254,14 @@
     {/key}
   </div>
 
-  <div class="wave" bind:this={wrap}>
-    <canvas
-      bind:this={canvas}
-      style="width:100%;height:{HEIGHT}px"
-      onpointerdown={down}
-      onpointermove={move}
-      onpointerup={up}
-    ></canvas>
+  <div class="wave" bind:this={wrap} role="presentation" onpointerdown={down} onpointermove={move} onpointerup={up}>
+    {#if picture?.source.probe?.video && duration}
+      <div class="picture">
+        <Filmstrip source={picture.source} start={picture.start} end={picture.start + duration} height={44} />
+        <div class="head" style="left:{(time / duration) * 100}%"></div>
+      </div>
+    {/if}
+    <canvas bind:this={canvas} style="width:100%;height:{HEIGHT}px"></canvas>
     {#if !a || !b}
       <div class="loading">Preparing audio…</div>
     {/if}
@@ -303,6 +322,8 @@
     border: 1px solid var(--border); cursor: crosshair; touch-action: none;
   }
   canvas { display: block; }
+  .picture { position: relative; border-bottom: 1px solid var(--border); }
+  .head { position: absolute; top: 0; bottom: 0; width: 1.5px; background: var(--text); pointer-events: none; }
   .loading {
     position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-dim);
   }

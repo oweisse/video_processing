@@ -127,12 +127,21 @@ def scan(output_dir, extra_sources=()):
 
     with_sidecar = set()
     unknown = []
+    exports = []
     for sidecar in sorted(output_dir.glob("*.params.json")):
         record = _load_json(sidecar)
         if not isinstance(record, dict):
             continue
         if record.get("kind") == "export":       # an edit's export: listed with its project
-            with_sidecar.add(record.get("output") or "")
+            name = record.get("output") or ""
+            with_sidecar.add(name)
+            path = output_dir / name
+            exists = bool(name) and path.is_file()
+            exports.append({"file": name, "path": str(path), "exists": exists,
+                            "size": path.stat().st_size if exists else None,
+                            "created": record.get("created"),
+                            "project": (record.get("project") or {}).get("name")
+                            or Path(record.get("project_path") or "").parent.name or None})
             continue
         out = _output_from_sidecar(output_dir, sidecar, record)
         with_sidecar.add(out["file"])
@@ -169,6 +178,7 @@ def scan(output_dir, extra_sources=()):
     from . import projects
     return {"output_dir": str(output_dir), "sources": ordered,
             "unknown": sorted(unknown, key=lambda o: o["file"]),
+            "exports": sorted(exports, key=lambda o: o["created"] or "", reverse=True),
             "projects": projects.list_projects(output_dir)}
 
 

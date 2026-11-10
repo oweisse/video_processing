@@ -1,6 +1,7 @@
 # GUI redesign: from audio cleaner to home-video editor
 
-Status: **plan, not started** (written 2026-11-10, against 0.5.0, commit `bd6ff94`).
+Status: **phase A implemented, phase B partly** (unreleased); phases C–H not started. Written 2026-11-10,
+against 0.5.0, commit `bd6ff94`. See §0.4 for what the implementation changed.
 This document is self-contained: an implementer who has not seen the discussion that led
 to it can execute it. It builds on `docs/gui-design.md` (the 0.5.0 design); where the two
 disagree about anything listed here, this document wins.
@@ -48,6 +49,67 @@ video editing".
 
 So: design for several tracks, per-clip effects and per-source "versions" now, even
 where only one of each exists yet.
+
+### 0.4 Implementation progress and deviations
+
+Where the implementation differs from the text below, this list wins.
+
+**Phase A (shell, look, Media)** — done.
+- Icons: `@lucide/svelte` pinned at 1.64.0; `components/Icon.svelte` imports each icon by
+  path, so add a name there before using it.
+- Posters: the default set keeps its 0.5.0 cache name (`posters/<id>_<i>.jpg`); only the
+  12-frame set uses `<id>_12_<i>.jpg`. The grid's resting poster is frame 1 of the
+  default four, the same instant as frame 4 of the twelve.
+- `library.scan` already returns `exports` (§11) — the Media "Exports" bin needs it.
+- The top bar shows the timeline name only; undo/redo and the save state stay in the
+  editor's own header until phase D.
+- `routes/Library.svelte` is gone (Media replaces it); `routes/Jobs.svelte` became
+  `components/JobList.svelte`, used by the Jobs drawer and by Deliver's render queue.
+  Workspaces live in `src/workspaces/`, Media's parts in `src/media/`.
+- Enhance hosts the 0.5.0 Compare / Candidates / New run pages, chosen by `out`,
+  `tab=candidates` + `plan` + `win`, and `tab=new`; with none of those it shows a source
+  list and the source's details (the Media details component). `links.*` in
+  `lib/router.svelte.ts` builds these URLs; use them instead of hand-built hashes.
+- Deliver lists timelines (export still starts from the editor) and the export jobs.
+- Extra: in Media, ←/→ move the selection and Enter opens the video in Enhance.
+
+**Phase B (Enhance)** — navigation done, merge of the panels not yet. Built after the
+user found it hard to move between a video's pieces and back to all videos:
+- A video's *pieces* are its cleaned outputs and tuned windows in time order
+  (`src/media/pieces.ts`). Enhance is a three-level hierarchy: All videos (an overview of
+  every video with all its pieces) › a video (its details) › a piece (Compare for an
+  output, Candidates for a tuned window). Breadcrumb on top; `[`/`]` previous/next piece,
+  `{`/`}` previous/next video, Esc up a level.
+- The left panel is a tree of videos and their pieces (the current one open) instead of
+  a flat list. URLs are built by `src/enhance/nav.ts` and always carry the source id.
+- The whole-video bar (`enhance/PieceBar.svelte`, also in Media's details instead of the
+  old coverage bar) has a **filmstrip** of frames along the video above the Cleaned and
+  Tuned lanes; hovering a piece shows a frame from its middle and dims the strip outside
+  it. New endpoint `GET /media/frame?source=&t=&w=160|320` (cached in
+  `_gui/cache/frames/`, `t` kept to 0.1 s).
+- `ABDeck` takes `picture: {source, start}` and draws a filmstrip of that stretch above
+  the two waveforms (playhead through it; clicking it seeks like the waveform).
+- The position in the source survives switching pieces (`lib/playhead.ts`, used by
+  `ABDeck`): a piece that covers the last moment heard opens there, on the same side,
+  and keeps playing if the switch was within 3 s of the last frame.
+- A video's page plays the whole original (`enhance/SourcePlayer.svelte`: proxy when
+  prepared, else `/media/file`, with a message when the browser cannot play the file).
+  The piece bar gets the player's time, a selection, `onseek` and `onrange`: a click
+  jumps, a click-and-drag anywhere (even starting on a piece) chooses a span while the
+  player shows the frame under the mouse, then parks at the span's start; a click on a
+  piece still opens it. `I`/`O` mark a span at the playhead; *Clean this span…* /
+  `Enter` open New clean with it. The span is meant to serve later actions too (cut it
+  into a timeline, enhance it), not only cleaning. On other pages a click
+  on the bar opens the video page at `?t=`.
+- Names shown in the UI pass through `ltr()` (`lib/bidi.ts`), which isolates
+  right-to-left runs so mixed Hebrew/digit file names read in order. Display only.
+- Candidates shows the source picture for the window (large, above the A/B deck) on the
+  A/B clock via `lib/videosync.ts` (`followClock`, shared with Compare), offset by the
+  window start; `↑`/`↓` step through candidates in table order, and the candidate card
+  (top right) carries its measurements and verdict so the table need not be in view.
+- Still to do for phase B: the right-hand Result / Candidates / New / Versions tabs
+  around one `ABDeck`. Compare, Candidates and New run are still the 0.5.0 pages (without
+  their own breadcrumbs) inside the workspace.
 
 ---
 
