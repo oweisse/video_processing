@@ -199,6 +199,7 @@ def test_autotune_end_to_end(fx, tmp_path):
         assert params["declick_nr"] == auto["picked"]["declick"]
     assert params["atten_lim_db"] == auto["picked"]["atten"]
     rebuilt = vars(build_parser().parse_args(shlex.split(record["reproduce"])[1:]))
+    rebuilt.pop("progress")       # how a run reports itself: not recorded
     assert rebuilt == params and "--autotune" not in record["reproduce"]
 
 
@@ -225,4 +226,5 @@ def test_auto_loudness_target_keeps_dynamics(fx, tmp_path):
     assert record["results"]["loudnorm_mode"] == "linear"
     assert abs(record["results"]["final_lufs"] - chosen) < 1.0
     rebuilt = vars(build_parser().parse_args(shlex.split(record["reproduce"])[1:]))
+    rebuilt.pop("progress")
     assert rebuilt == record["parameters"]

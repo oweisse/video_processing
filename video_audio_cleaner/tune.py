@@ -10,6 +10,8 @@ that keeps the voices intact. Output, in --out_dir:
                    (same video and grid) and tunes only the new ones. Changing only
                    the scoring criteria rescores the saved measurements instantly.
   listen/*.wav     per window: source → best → runner-up, loudness-matched
+  candidates/<window>/   with --keep_candidates: the source and every candidate as
+                   AAC, for auditioning (clean-audio-gui); their loudness is in plan.json
 
 Scoring (all thresholds are flags). Each window is judged against its own
 gentlest candidate (the one that keeps the most speech fidelity), so a tape that
@@ -43,7 +45,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import events
 from . import metrics as M
+from .console import print_info
 from .timeparse import format_time_filename, parse_time_string
 
 SAMPLE_RATE = 48000
@@ -275,7 +279,7 @@ def score_candidates(candidates, source, fidelity_tolerance=0.03, max_warble_inc
 
 # ------------------------------------------------------------------ rendering
 def _quiet(fn, *args, **kwargs):
-    with contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.redirect_stdout(io.StringIO()), events.muted():
         return fn(*args, **kwargs)
 
 
@@ -310,9 +314,9 @@ def evaluate_window(video, window, grid, separate_music, work, music=None):
             music.get("max_warble_increase", DEFAULT_MUSIC_WARBLE_INCREASE))
         music.update(level_db=level, table=table, source_warble=source_warble)
         spell = lambda v: "off" if v is None else f"{v:g}"
-        print(f"  music bed: {spell(level)} dB  (warble: original {source_warble:.1f}; "
-              + ", ".join(f"{spell(t['level_db'])} {t['warble']:.1f}" for t in table)
-              + ")", flush=True)
+        print_info(f"  music bed: {spell(level)} dB  (warble: original {source_warble:.1f}; "
+                   + ", ".join(f"{spell(t['level_db'])} {t['warble']:.1f}" for t in table)
+                   + ")")
         # Score against what will be heard, speech + that bed. Against the
         # music-laden source, removing the music would count as lost fidelity;
         # against the bare speech stem, Demucs's own damage would be invisible.
@@ -382,6 +386,77 @@ def write_listening_file(work, candidates, picks, out_path):
         f"concat=n={len(order)}:v=0:a=1[out]"
     _ffmpeg(*inputs, "-filter_complex", graph, "-map", "[out]", "-acodec", "pcm_s24le",
             str(out_path))
+
+
+CANDIDATE_AUDIO_BITRATE = "192k"   # what clean-audio's output carries: hear what you get
+
+
+def _encode_measured(src, dst):
+    """src WAV → dst AAC, returning the file's integrated loudness (LUFS) or None."""
+    from .postprocess import parse_ebur128_summary
+
+    out = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-nostats", "-i", src,
+                          "-af", "ebur128", "-c:a", "aac", "-b:a", CANDIDATE_AUDIO_BITRATE,
+                          "-movflags", "+faststart", dst],
+                         capture_output=True, text=True, errors="replace")
+    if out.returncode != 0:
+        raise subprocess.CalledProcessError(out.returncode, out.args, stderr=out.stderr)
+    lufs, _ = parse_ebur128_summary(out.stderr)
+    return lufs
+
+
+def keep_candidate_audio(work, candidates, out_dir, label):
+    """Save the window's source and every candidate as AAC under out_dir/candidates/label.
+
+    Returns the plan's "candidate_files" entry. Candidates are kept as measured
+    (before normalisation), so each file's loudness is recorded for level matching.
+    """
+    rel = Path("candidates") / label
+    folder = Path(out_dir) / rel
+    if folder.exists():
+        import shutil
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True)
+    files = {"dir": rel.as_posix(),
+             "source": {"file": "source.m4a",
+                        "lufs": _encode_measured(os.path.join(work, "raw.wav"),
+                                                 str(folder / "source.m4a"))},
+             "candidates": []}
+    for i in range(len(candidates)):
+        name = f"cand_{i}.m4a"
+        files["candidates"].append(
+            {"file": name, "lufs": _encode_measured(os.path.join(work, f"cand_{i}.wav"),
+                                                    str(folder / name))})
+    return files
+
+
+def set_user_pick(plan_path, label, index):
+    """Make candidate `index` of window `label` the pick (None: back to autotune's).
+
+    A user's pick survives rescoring and is what --autotune and clean-audio-batch
+    then use for that window.
+    """
+    plan_path = Path(plan_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    entry = next(w for w in plan["windows"] if w["label"] == label)
+    r = _result_from_entry(entry)
+    r["user_pick"] = None if index is None else int(index)
+    if r["user_pick"] is not None and not 0 <= r["user_pick"] < len(r["candidates"]):
+        raise IndexError(f"window {label} has no candidate {index}")
+    r["best"], r["runner_up"] = score_candidates(r["candidates"], r["source"],
+                                                 **plan["criteria"])
+    _honour_user_pick(r)
+    new_entry = _window_entry(r, plan.get("output_flags") or {})
+    plan["windows"] = [new_entry if w["label"] == label else w for w in plan["windows"]]
+    tmp = plan_path.with_name("plan.json.partial")
+    tmp.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, plan_path)
+    return new_entry
+
+
+def _honour_user_pick(r):
+    if r.get("user_pick") is not None:
+        r["best"] = r["candidates"][r["user_pick"]]
 
 
 # ------------------------------------------------------------------ reports
@@ -496,6 +571,10 @@ def build_parser():
                    type=lambda v: "auto" if v.strip().lower() == "auto" else float(v),
                    help="Loudness target to put in the plan's flags (default: auto, the "
                         "loudest a plain volume change reaches without compression).")
+    p.add_argument("--keep_candidates", action="store_true",
+                   help="Keep every candidate's audio (AAC, in OUT_DIR/candidates/) for "
+                        "auditioning; windows tuned earlier without it are measured again.")
+    events.add_argument(p)
     p.add_argument("--retune", action="store_true",
                    help="Ignore windows already tuned in OUT_DIR/plan.json and redo them.")
     return p
@@ -515,6 +594,8 @@ def _window_entry(r, output_flags):
         "source": {k: getattr(r["source"], k) for k in ("speech_to_hiss", "warble", "clicks")},
         "music": r.get("music"),
         "candidates": [asdict(c) for c in r["candidates"]],
+        "candidate_files": r.get("candidate_files"),
+        "user_pick": r.get("user_pick"),
     }
 
 
@@ -535,7 +616,8 @@ def _result_from_entry(e):
                        clicks=src["clicks"])
     return dict(window=Window(e["label"], e["start_sec"], e["end_sec"]), source=source,
                 candidates=candidates, best=best, runner_up=runner,
-                listen_pick=e.get("listening_file_pick"), music=e.get("music"))
+                listen_pick=e.get("listening_file_pick"), music=e.get("music"),
+                candidate_files=e.get("candidate_files"), user_pick=e.get("user_pick"))
 
 
 def _reusable(previous, video, grid_spec):
@@ -606,18 +688,24 @@ def _archive(plan_path, why):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     kept = plan_path.with_name(f"plan.{stamp}.json")
     os.replace(plan_path, kept)
-    print(f"Earlier tuning kept as {kept.name} ({why}).")
+    print_info(f"Earlier tuning kept as {kept.name} ({why}).")
 
 
-def _print_candidate(n, total, source, c):
+def _print_candidate(n, total, source, c, label=None):
+    if events.enabled():
+        events.emit("candidate", window=label, index=n - 1, total=total, candidate=asdict(c))
+        return
     print(f"  {n:2d}/{total}  {c.describe():42s} "
           f"fidelity {c.fidelity:.3f}  hiss {c.speech_to_hiss - source.speech_to_hiss:+5.1f} dB  "
           f"warble {c.warble:4.1f}  clicks {c.clicks:4.1f}/s", flush=True)
 
 
 def run(video, windows, out_dir, stem, grid_spec, criteria, output_flags,
-        retune=False, argv=None):
+        retune=False, argv=None, keep_candidates=False, need_candidates=False):
     """Tune `windows` into out_dir/plan.json, reusing what is already measured there.
+
+    keep_candidates: keep each newly measured window's candidate audio.
+    need_candidates: also re-measure requested windows that were tuned without it.
 
     Returns (results, tuned): results for every window in the plan (not only the
     requested ones), and the labels of the windows that were measured just now.
@@ -645,33 +733,38 @@ def run(video, windows, out_dir, stem, grid_spec, criteria, output_flags,
     def rescored(entry):
         r = _result_from_entry(entry)
         r["best"], r["runner_up"] = score_candidates(r["candidates"], r["source"], **criteria)
+        _honour_user_pick(r)
         return r
 
     # Windows already measured are kept and rescored under the current criteria;
     # a requested window matches a measured one by label or by its start and end.
-    results, todo, used = [], [], set()
+    results, todo, used, remeasured = [], [], set(), set()
     for w in windows:
         hit = next((label for label, e in reusable.items() if _same_window(e, w)), None)
-        if hit:
+        if hit and need_candidates and not reusable[hit].get("candidate_files"):
+            used.add(hit)          # measured without audio: measure again, keeping it
+            remeasured.add(hit)
+            todo.append(w)
+        elif hit:
             results.append(rescored(reusable[hit]))
             used.add(hit)
         else:
             todo.append(w)
     results = [rescored(e) for label, e in reusable.items() if label not in used] + results
-    if used:
-        print(f"Reusing earlier tuning for {len(used)} window(s) from {plan_path} "
+    if used - remeasured:
+        print_info(f"Reusing earlier tuning for {len(used - remeasured)} window(s) from {plan_path} "
               f"(--retune to redo).")
     if not todo:
         _save(out_dir, video, stem, criteria, grid_spec, output_flags, argv, results)
-        print("Nothing new to tune; picks rescored with the current criteria.")
+        print_info("Nothing new to tune; picks rescored with the current criteria.")
         return results, set()
 
     total_audio = sum(w.duration for w in todo)
-    print(f"Tuning {len(todo)} window(s), {total_audio / 60:.1f} min of audio, "
+    print_info(f"Tuning {len(todo)} window(s), {total_audio / 60:.1f} min of audio, "
           f"{per_window} candidates each ({len(grid[0])} DeepFilterNet runs per window). "
           f"Progress is saved after every window.")
     for wi, w in enumerate(todo, 1):
-        print(f"\n[{wi}/{len(todo)}] {w.label}  ({w.duration:.0f} s)")
+        print_info(f"\n[{wi}/{len(todo)}] {w.label}  ({w.duration:.0f} s)")
         with tempfile.TemporaryDirectory(prefix="vac_tune_") as work:
             t0 = time.time()
             done = []
@@ -680,20 +773,27 @@ def run(video, windows, out_dir, stem, grid_spec, criteria, output_flags,
                                                           DEFAULT_MUSIC_WARBLE_INCREASE)}
             for source, c, done in evaluate_window(video, w, grid,
                                                    grid_spec["separate_music"], work, music):
-                _print_candidate(len(done), per_window, source, c)
+                _print_candidate(len(done), per_window, source, c, w.label)
             best, runner_up = score_candidates(done, source, **criteria)
             write_listening_file(work, done, [best, runner_up], listen / f"{w.label}.wav")
+            files = None
+            if keep_candidates:
+                print_info(f"  keeping {len(done)} candidates' audio for auditioning")
+                files = keep_candidate_audio(work, done, out_dir, w.label)
         tag = "" if best.qualifies else "  (nothing met --min_fidelity: highest fidelity)"
-        print(f"  ★ {best.describe()}{tag}   [{time.time() - t0:.0f}s]")
+        print_info(f"  ★ {best.describe()}{tag}   [{time.time() - t0:.0f}s]")
+        events.emit("window", window=w.label, picked=asdict(best),
+                    runner_up=asdict(runner_up) if runner_up else None,
+                    plan=str(plan_path))
         results.append(dict(window=w, source=source, candidates=done, best=best,
-                            runner_up=runner_up,
+                            runner_up=runner_up, candidate_files=files,
                             music=music if grid_spec["separate_music"] else None))
         _save(out_dir, video, stem, criteria, grid_spec, output_flags, argv, results)
     return results, {w.label for w in todo}
 
 
 def autotune_window(video, start, end, tune_dir, separate_music=False, music_levels=None,
-                    source="tape"):
+                    source="tape", keep_candidates=False):
     """Best settings for one window, from the cache or by tuning it now.
 
     Adopts the cache's grid and criteria when it has compatible measurements, so
@@ -722,7 +822,8 @@ def autotune_window(video, start, end, tune_dir, separate_music=False, music_lev
             stem = previous.get("stem")
     window = Window(f"{format_time_filename(start)}-{format_time_filename(end)}", start, end)
 
-    results, tuned = run(video, [window], tune_dir, stem, grid_spec, criteria, output_flags)
+    results, tuned = run(video, [window], tune_dir, stem, grid_spec, criteria, output_flags,
+                         keep_candidates=keep_candidates)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     entry = next(e for e in plan["windows"] if _same_window(e, window))
     r = next(r for r in results if r["window"].label == entry["label"])
@@ -731,6 +832,12 @@ def autotune_window(video, start, end, tune_dir, separate_music=False, music_lev
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    with events.session("clean-audio-tune", sys.argv[1:] if argv is None else argv,
+                        args.progress):
+        _main(args, argv)
+
+
+def _main(args, argv):
     windows = list(args.windows)
     if args.windows_file:
         windows += [parse_window(line) for line in
@@ -752,13 +859,14 @@ def main(argv=None):
 
     started = time.time()
     run(args.video, windows, args.out_dir, args.stem, grid_spec, criteria, output_flags,
-        retune=args.retune, argv=argv)
+        retune=args.retune, argv=argv, keep_candidates=args.keep_candidates,
+        need_candidates=args.keep_candidates)
     plan_path = args.out_dir / "plan.json"
-    print(f"\nDone in {(time.time() - started) / 60:.1f} min.")
-    print(f"  Report:    {args.out_dir / 'report.md'}")
-    print(f"  Listen:    {args.out_dir / 'listen'}/")
-    print(f"  Plan:      {plan_path}")
-    print(f"  Render with:  clean-audio-batch {plan_path} --output_dir <DIR>")
+    print_info(f"\nDone in {(time.time() - started) / 60:.1f} min.\n"
+               f"  Report:    {args.out_dir / 'report.md'}\n"
+               f"  Listen:    {args.out_dir / 'listen'}/\n"
+               f"  Plan:      {plan_path}\n"
+               f"  Render with:  clean-audio-batch {plan_path} --output_dir <DIR>")
 
 
 if __name__ == "__main__":

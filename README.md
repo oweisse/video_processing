@@ -35,7 +35,8 @@ they re-generate speech from a degraded input and can subtly change how people s
 ```
 
 This installs FFmpeg (via Homebrew), creates `./venv`, and installs the project with the
-Demucs extra and the test tools. It picks Python 3.11 or 3.10 automatically: DeepFilterNet's
+Demucs extra, the GUI and the test tools; with Node.js 20+ present (`brew install node`)
+it also builds the GUI's frontend. It picks Python 3.11 or 3.10 automatically: DeepFilterNet's
 Rust core (DeepFilterLib 0.5.6) only ships macOS wheels up to 3.11, so newer Pythons would
 need a Rust toolchain. Any recent PyTorch works — DeepFilterNet 0.5.6 predates current
 torchaudio, and `denoise.py` bridges the two (a slow test guards it).
@@ -59,6 +60,61 @@ source venv/bin/activate
 > are in the repo root.
 
 The legacy entry point still works: `python3 extract_and_filter_audio.py ...`
+
+## The GUI: `clean-audio-gui`
+
+```bash
+./venv/bin/clean-audio-gui
+```
+
+opens a window over an output folder (the folder you pass to `--output_dir`; it asks
+for one the first time, then remembers the last). Everything it shows comes from the
+files the command-line tools write, so runs from the terminal appear there too.
+
+- **Library**: every source video with its outputs, grouped, with a bar showing which
+  parts of the video are cleaned, the settings each output used, and its loudness.
+- **Compare**: the output's picture with one key to flip the sound between the original
+  (`A`) and the cleaned track (`B`). Both play in sync all the time, so switching is
+  instant and keeps your place. Tap a key to switch, hold it to audition that side
+  until you let go. Both sides play at the same loudness (*Level-match*, `M`) so the
+  louder one never passes for the better one. `I`/`O` and `L` loop a stretch; ⇧-drag
+  the waveform does the same.
+- **Candidates**: every setting autotune tried for a window, as a table and a
+  warble-against-hiss chart. Click one to hear it against the source; *Render this one*
+  makes an output from it, *Make it the pick* makes autotune (and `clean-audio-batch`)
+  use it for that window from then on.
+- **New run**: a form over `clean-audio` that always shows the exact command it will
+  run. Several windows at once queue several runs. Autotune is on by default and keeps
+  every candidate's audio for the Candidates view.
+- **Jobs**: one cleaning job runs at a time (they each want most of the machine); the
+  rest wait in the queue. Progress, cancel, logs, and *Compare* when it is done.
+
+- **Edit**: cut long videos into pieces, join pieces from several videos, and lay
+  music under them, then export one MP4 for Google Photos or YouTube. Each video is
+  first *prepared* once (a 540p copy for instant scrubbing, thumbnails, a waveform;
+  about 1 GB per hour, in `_gui/cache/`). Mark In/Out in the source viewer (`I`/`O`)
+  and add the range; on the timeline drag clips to reorder and their edges to trim,
+  `S` splits at the playhead, `⌘Z` undoes. A clip plays its cleaned sound wherever a
+  cleaned output covers it, else the original (the inspector offers "Clean this
+  range…"). Music is lowered under speech on export. The export is lossless when it
+  can be (one video, cuts on keyframes, picture unchanged); otherwise it re-encodes to
+  H.264 (x264, or Apple's hardware encoder for speed) and says why. Loudness is set to
+  −16 LUFS. Projects live in `OUTPUT_DIR/_projects/`, and `clean-audio-export
+  _projects/NAME/project.json` renders one from the terminal.
+
+Drop a video onto the window to start a run on it, or a folder to open it as the
+project. `--browser` serves the same interface to your web browser instead of a window
+(no drag-and-drop or native dialogs there), and `--port` changes the local port (8787).
+The server only listens on this computer.
+
+The GUI keeps its own files in `OUTPUT_DIR/_gui/` (job history and logs, audio prepared
+for comparing); deleting that folder loses nothing else. Deleting an output in the GUI
+moves it and its `.params.json` to `OUTPUT_DIR/_trash/`. Kept candidate audio lives in
+the tuning cache (`_tuning/<video>/candidates/`, about 25 MB per minute of window) and
+can be deleted per window from the Candidates view.
+
+How it is built, and what comes next (cutting, stitching, soundtrack, export), is in
+[docs/gui-design.md](docs/gui-design.md).
 
 ## Pipeline
 
@@ -580,7 +636,7 @@ no music.
 Install the test dependencies into the same environment:
 
 ```bash
-./venv/bin/pip install -e ".[separation,dev]"
+./venv/bin/pip install -e ".[separation,gui,dev]"
 ```
 
 Two test tiers:
@@ -598,6 +654,17 @@ interrupt cleanup) in a few seconds.
 
 runs the slow tier against the real DeepFilterNet and Demucs models (well under a
 minute on an M3). Add `-m "slow and not demucs"` to skip the slowest test.
+
+The GUI's frontend (Svelte + TypeScript, in `gui/`) has its own unit tests and type
+check:
+
+```bash
+cd gui && npm test && npm run check
+```
+
+For frontend work, run the server with `./venv/bin/clean-audio-gui --no-open` and
+`npm run dev` in `gui/` (Vite on port 5173, proxying the API); `npm run build` writes
+the bundle the GUI serves.
 
 Test material is synthesised on the fly by `tests/fixtures.py` — speech from macOS
 `say`, plus seeded hiss, a jittered click train and a music bed — so no recordings are

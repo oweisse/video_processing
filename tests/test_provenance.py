@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from video_audio_cleaner.cli import build_parser
-from video_audio_cleaner.provenance import full_command
+from video_audio_cleaner.provenance import NOT_RECORDED, full_command
 
 CLEAN = Path(sys.executable).with_name("clean-audio")
 
@@ -41,7 +41,7 @@ def test_every_output_gets_a_complete_sidecar(fx, tmp_path):
     record = json.loads(video.with_suffix(".params.json").read_text())
 
     # Every parser option is recorded, defaults included.
-    assert set(record["parameters"]) == set(parse(["x", "--output_dir", "y"]))
+    assert set(record["parameters"]) == set(parse(["x", "--output_dir", "y"])) - NOT_RECORDED
     assert record["parameters"]["atten_lim_db"] == 20.0
     assert record["parameters"]["output"] == video.name
 
@@ -55,7 +55,10 @@ def test_every_output_gets_a_complete_sidecar(fx, tmp_path):
 
     # The recorded command reproduces the same parameters.
     argv = shlex.split(record["reproduce"])
-    assert parse(argv[1:]) == record["parameters"]
+    reparsed = parse(argv[1:])
+    for key in NOT_RECORDED:
+        reparsed.pop(key)
+    assert reparsed == record["parameters"]
 
 
 def test_autotune_refuses_knobs_it_chooses(fx, tmp_path):

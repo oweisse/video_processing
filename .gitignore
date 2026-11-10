@@ -20,3 +20,7 @@ output_test_*.png
 test_frame_*.png
 
 .DS_Store
+
+# GUI frontend: dependencies and the build served by clean-audio-gui
+gui/node_modules/
+video_audio_cleaner/gui/static/

@@ -1,6 +1,7 @@
 # GUI design: Video Audio Cleaner desktop app
 
-Status: **design, decided, not implemented** (2026-11-07). This document makes
+Status: **phases 1, 2 and 3 implemented** (0.5.0); phase 4 (visual edits) designed only.
+See §0 for what the implementation changed. Designed 2026-11-07. This document makes
 every architectural decision so that implementation can start without further
 discussion. Where a choice was close, the alternative and the reason for the
 decision are recorded so they are not re-litigated.
@@ -11,6 +12,69 @@ familiarity with the current code: `video_audio_cleaner/cli.py` (the pipeline),
 `procs.py`, `ffmpeg_utils.py`, `graph.py`.
 
 ---
+
+## 0. Implementation status and deviations
+
+Built (0.5.0): §4 (CLI contract), §5 (server), §6 (all five views), phase 2 (native
+window), phase 3 (§8 projects and source preparation, §9 export, §10 editor). Where the
+implementation differs from the text below, this list wins:
+
+- **The window is the default**: `clean-audio-gui` opens a pywebview window;
+  `--browser` serves to the default browser, `--no-open` only runs the server. Native
+  dialogs are `GET /api/fs/pick` (501 in a browser, where the UI falls back to the
+  in-page browser over `GET /api/fs/list`). `GET /api/app` says which mode is running.
+  Dropped files give real paths through pywebview's `pywebviewFullPath`.
+- **Level matching is measured in the browser**, BS.1770 integrated loudness of the two
+  decoded buffers (`gui/src/lib/loudness.ts`), not taken from the sidecar:
+  `lufs_before_normalize` is the *denoised* audio's loudness, not the original's.
+  Candidates' stored `lufs` are kept in the plan but the player measures too, so every
+  comparison uses one method.
+- **Waveforms for Compare/Candidates are computed in the browser** from the decoded
+  buffers (`peaks.ts`). Server-side peak files (§5.4) are left for the phase-3 timeline,
+  where hour-long sources make them necessary.
+- **`/media/audio` prepares synchronously** (a few seconds at most for a window) and
+  returns the file; no 202/Retry-After dance.
+- **Picture sync** follows the *heard* audio (clock minus `AudioContext.outputLatency`);
+  measured drift 8–15 ms on a 720p output, with ±10 % playback-rate nudging instead of
+  seeks for drift under 0.5 s.
+- **Tuning progress**: the renders inside each candidate are muted in the event stream
+  (`events.muted()`), so a tuning job reports "candidate n/36" rather than inner passes.
+- Extra endpoints: `POST /api/jobs/preview` (the command a request would run, for the
+  form), `POST /api/reveal`, `GET /api/app`.
+- **API guard**: requests must carry `Host` 127.0.0.1/localhost and `/api/*` requests the
+  header `x-vac: 1` (other sites cannot send it without a CORS preflight the server never
+  grants); `/media/file` serves only files inside the project or registered sources.
+- **Phase 3 files**: preparation is `python -m video_audio_cleaner.prep proxy thumbs
+  peaks` (job type `prep`, light lane), into `_gui/cache/{proxy,thumbs,peaks}/`; the
+  proxy uses VideoToolbox with a 15-frame GOP and no B-frames; thumbnails are 72 px high
+  every 2 s. Export is `clean-audio-export project.json` (`--plan`, `--reencode`), job
+  type `export` in the heavy lane. Projects are `_projects/<name>/project.json`, added
+  songs are copied into `_projects/<name>/music/`, deleted projects go to
+  `_trash/_projects/`. Exports get a `.params.json` with `"kind": "export"` and are
+  listed with their project, not as outputs.
+- **Project model** as §8 with these differences: a clip's cleaned audio is
+  `audio: {file, output, start_sec, gain_db}` (absolute file for export, library name for
+  the player, the source time where that output starts), `null` for the source's own
+  sound, `{mute: true}` for silence. Ducking is one project-level setting,
+  `tracks.music_duck`, not per music clip. No separate `audio_assets` table.
+- **Export loudness is a single gain** measured with `ebur128` on an audio-only pass,
+  then a true-peak limiter (`alimiter`, up to 3 dB of overs; past that the gain is
+  lowered). Not two-pass `loudnorm`: its integrated measurement was 0.8 LU off on a
+  10 s edit with silence, and a plain gain never changes dynamics. Measured: exports
+  land within 0.1 LU of the target.
+- **Export clip inputs** are separate `-ss/-t` inputs per clip (input seeking), not
+  `trim` on one input: trimming would decode the whole source up to each cut.
+- **Editor preview**: no ducking (Web Audio cannot sidechain); crossfades are heard and
+  the picture switches at the fade's midpoint; the playback engine is `gui/src/lib/
+  program.ts` (two alternating proxy players, the next clip preloaded a second ahead).
+  When a trim leaves a clip outside its cleaned output, the editor switches it to
+  another covering output or to the original sound, and says so.
+- Editor keys as §10 except: `,` adds the marked range at the end, "Insert at playhead"
+  splits and inserts; `J` jumps back 5 s (browsers cannot play backwards); `L` plays at
+  normal speed (no 2×/4× shuttle yet). No source-viewer waveform yet (peaks are made
+  and served, `/media/peaks`, but not drawn).
+- Not done: `clean-audio-batch --progress json` (the GUI queues one clean job per window
+  instead), timing estimates from job history (the form uses fixed rates).
 
 ## 1. Goals and scope
 

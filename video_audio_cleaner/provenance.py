@@ -21,6 +21,8 @@ _REPO = Path(__file__).resolve().parent.parent
 # parses back to None. Without these, a reproduce command would silently fall
 # back to the default (e.g. unlimited attenuation would become 20 dB).
 NONE_SPELLING = {"atten_lim_db": "none", "music_level_db": "off"}
+# How a run reports itself, not what it makes: left out of the record.
+NOT_RECORDED = {"progress"}
 
 
 def sidecar_path(output_path):
@@ -37,7 +39,7 @@ def full_command(parser, args):
     argv = ["clean-audio"]
     positionals = []
     for action in parser._actions:  # noqa: SLF001 — argparse has no public walker
-        if action.dest == "help":
+        if action.dest == "help" or action.dest in NOT_RECORDED:
             continue
         value = getattr(args, action.dest, None)
         if not action.option_strings:
@@ -109,7 +111,8 @@ def write(output_path, parser, args, window, results):
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "command_as_typed": shlex.join(["clean-audio", *sys.argv[1:]]),
         "reproduce": shlex.join(full_command(parser, args)),
-        "parameters": {k: v for k, v in sorted(vars(args).items())},
+        "parameters": {k: v for k, v in sorted(vars(args).items())
+                       if k not in NOT_RECORDED},
         "window": window,
         "results": results,
         "environment": environment(),

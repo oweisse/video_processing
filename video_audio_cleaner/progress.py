@@ -7,6 +7,8 @@ instead, so piped runs still produce useful logs.
 import sys
 import time
 
+from . import events
+
 BAR_LEN = 30
 _MIN_ELAPSED_FOR_ETA = 0.5
 
@@ -60,8 +62,24 @@ class ProgressReporter:
         self.stream.flush()
         self._last_len = 0 if newline else len(line)
 
+    def _event(self, processed_sec, speed, force=False):
+        now = time.time()
+        if not force and now - self._last_plain < events.PROGRESS_INTERVAL:
+            return
+        self._last_plain = now
+        rate, elapsed = self._rate(processed_sec)
+        eta = None
+        if self.total_sec and rate and elapsed >= _MIN_ELAPSED_FOR_ETA:
+            eta = round(max(0.0, (self.total_sec - processed_sec) / rate), 1)
+        events.emit("progress", step=events.emitter.step, prefix=self.prefix,
+                    processed_sec=round(processed_sec, 3), total_sec=self.total_sec,
+                    speed=speed or (f"{rate:.1f} sec/sec" if rate else None), eta_sec=eta)
+
     def update(self, processed_sec, speed=None):
         if self._finished:
+            return
+        if events.enabled():
+            self._event(processed_sec, speed)
             return
         pct = None
         if self.total_sec:
@@ -98,6 +116,9 @@ class ProgressReporter:
             return
         self._finished = True
         total = self.total_sec
+        if events.enabled():
+            self._event(total or 0.0, speed, force=True)
+            return
         if self.is_tty:
             if total:
                 bar = "█" * BAR_LEN

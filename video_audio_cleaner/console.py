@@ -1,6 +1,8 @@
 """Terminal output helpers shared by every stage."""
 import sys
 
+from . import events
+
 _COLORS = {
     "blue": "\033[94m",
     "green": "\033[92m",
@@ -21,21 +23,38 @@ def _styled(message, color=None, stream=None):
 
 
 def print_step(step_num, total_steps, title):
+    if events.enabled():
+        events.emitter.step = step_num
+        events.emit("step", index=step_num, total=total_steps, title=title)
+        return
     sys.stdout.write("\n")
     _styled(f"[{step_num}/{total_steps}] {title}", "blue")
 
 
 def print_success(message):
+    if events.enabled():
+        events.emit("message", level="success", text=message)
+        return
     _styled(f"✔ {message}", "green")
 
 
 def print_warning(message):
+    if events.enabled():
+        events.emit("message", level="warning", text=message)
+        return
     _styled(f"⚠ {message}", "yellow")
 
 
 def print_error(message):
+    if events.enabled():
+        events.emitter.last_error = message
+        events.emit("message", level="error", text=message)
+        return
     _styled(f"✘ {message}", "red", stream=sys.stderr)
 
 
 def print_info(message):
+    if events.enabled():
+        events.emit("message", level="info", text=message)
+        return
     _styled(message)

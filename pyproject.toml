@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "video-audio-cleaner"
-version = "0.4.0"
+version = "0.5.0"
 description = "Extract, denoise, and re-merge speech audio in videos (DeepFilterNet + optional Demucs)"
 readme = "README.md"
 # DeepFilterLib 0.5.6 (DeepFilterNet's Rust core) ships macOS wheels only for
@@ -24,15 +24,23 @@ dependencies = [
 
 [project.optional-dependencies]
 separation = ["demucs>=4.0.1"]
-dev = ["pytest>=8"]
+# clean-audio-gui; pywebview only for its --window mode.
+gui = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pywebview>=5"]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 clean-audio = "video_audio_cleaner.cli:main"
 clean-audio-tune = "video_audio_cleaner.tune:main"
 clean-audio-batch = "video_audio_cleaner.batch:main"
+clean-audio-gui = "video_audio_cleaner.gui.main:main"
+clean-audio-export = "video_audio_cleaner.export:main"
 
 [tool.setuptools]
-packages = ["video_audio_cleaner"]
+packages = ["video_audio_cleaner", "video_audio_cleaner.gui"]
+
+[tool.setuptools.package-data]
+# The built frontend (cd gui && npm run build).
+"video_audio_cleaner.gui" = ["static/*", "static/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -18,7 +18,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import ffmpeg_utils, graph, procs
+from . import events, ffmpeg_utils, graph, procs
 from .console import print_error, print_info, print_step, print_success, print_warning
 from .timeparse import format_time_filename, parse_time_string, positive_time
 
@@ -124,6 +124,17 @@ def build_parser():
                              "transfer. 'digital' (a camera or phone video, not a tape "
                              "transfer) leaves hiss reduction and declick off: on such "
                              "recordings they only strip the room tone and reverb.")
+    parser.add_argument("--keep_candidates", action="store_true",
+                        help="With --autotune: when a window is tuned now, keep every "
+                             "candidate's audio (AAC) in the tuning cache so it can be "
+                             "auditioned later (clean-audio-gui does).")
+    parser.add_argument("--from_candidate", nargs=3, default=None,
+                        metavar=("PLAN", "WINDOW", "INDEX"),
+                        help="Render with one tuned candidate instead of autotune's pick: "
+                             "PLAN is a tuning plan.json, WINDOW its window label (e.g. "
+                             "24m45s-29m45s), INDEX the candidate's position in that "
+                             "window's list. Sets the window and music separation from "
+                             "the plan.")
     parser.add_argument("--autotune_dir", type=str, default=None,
                         help="Tuning cache for --autotune (default: "
                              "OUTPUT_DIR/_tuning/<video name>, shared with clean-audio-tune "
@@ -252,6 +263,7 @@ def build_parser():
 
     parser.add_argument("--verbose", action="store_true",
                         help="Print every ffmpeg command line before running it.")
+    events.add_argument(parser)
     parser.add_argument("--keep_temp", type=str, default=None, metavar="DIR",
                         help="Copy intermediate WAVs into DIR for debugging: 01_raw, "
                              "02_vocals/02_music (with --separate_music), 03_denoised, "
@@ -430,8 +442,38 @@ def _autotune(args, argv, input_path, output_dir, start, duration):
         fixed_music = "off" if args.music_level_db is None else f"{args.music_level_db:g}"
     picked, entry, reused, plan_path = tune.autotune_window(
         input_path, start, start + duration, tune_dir, args.separate_music, fixed_music,
-        args.source)
+        args.source, keep_candidates=args.keep_candidates)
+    _apply_candidate(args, picked)
 
+    how = "reused earlier tuning" if reused else \
+        f"tuned {len(entry['candidates'])} candidates in {time.time() - began:.0f}s"
+    print_success(f"Autotune picked: {picked.describe()} ({how})")
+    print_info(f"  fidelity {picked.fidelity:.3f}, hiss removed {picked.hiss_gain_db:+.1f} dB, "
+               f"ticks {entry['source']['clicks']:.1f} → {picked.clicks:.1f}/s")
+    record = _tuning_record(plan_path, entry, picked)
+    record["reused"] = reused
+    if entry.get("user_pick") is not None:
+        record["chosen_by"] = "user"
+    return record
+
+
+_PICK_FIELDS = ("atten", "hiss", "declick", "music_level_db", "fidelity", "hiss_gain_db",
+                "warble", "clicks", "score")
+
+
+def _tuning_record(plan_path, entry, picked):
+    return {
+        "cache": str(plan_path),
+        "window": entry["label"],
+        "criteria": json.loads(Path(plan_path).read_text(encoding="utf-8")).get("criteria"),
+        "music_bed": entry.get("music"),
+        "picked": {k: getattr(picked, k) for k in _PICK_FIELDS},
+        "candidates_tried": len(entry["candidates"]),
+    }
+
+
+def _apply_candidate(args, picked):
+    """Set the options a tuned candidate stands for."""
     args.atten_lim_db = picked.atten
     args.reduce_hiss = picked.hiss != "off"
     if args.reduce_hiss:
@@ -447,23 +489,60 @@ def _autotune(args, argv, input_path, output_dir, start, duration):
     if args.declick:
         args.declick_nr = picked.declick_nr
 
-    how = "reused earlier tuning" if reused else \
-        f"tuned {len(entry['candidates'])} candidates in {time.time() - began:.0f}s"
-    print_success(f"Autotune picked: {picked.describe()} ({how})")
-    print_info(f"  fidelity {picked.fidelity:.3f}, hiss removed {picked.hiss_gain_db:+.1f} dB, "
-               f"ticks {entry['source']['clicks']:.1f} → {picked.clicks:.1f}/s")
-    return {
-        "cache": str(plan_path),
-        "reused": reused,
-        "window": entry["label"],
-        "criteria": json.loads(plan_path.read_text(encoding="utf-8")).get("criteria"),
-        "music_bed": entry.get("music"),
-        "picked": {k: getattr(picked, k) for k in ("atten", "hiss", "declick",
-                                                   "music_level_db", "fidelity",
-                                                   "hiss_gain_db", "warble", "clicks",
-                                                   "score")},
-        "candidates_tried": len(entry["candidates"]),
-    }
+
+def load_candidate(plan_path, label, index):
+    """(plan, window entry, Candidate) for --from_candidate; RuntimeError if absent."""
+    from . import tune
+
+    plan_path = Path(os.path.abspath(os.path.expanduser(plan_path)))
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not read the tuning plan {plan_path}: {exc}") from None
+    entry = next((w for w in plan.get("windows", []) if w["label"] == label), None)
+    if entry is None:
+        known = ", ".join(w["label"] for w in plan.get("windows", [])) or "none"
+        raise RuntimeError(f"{plan_path.name} has no window {label} (it has: {known}).")
+    try:
+        candidate = tune.Candidate(**entry["candidates"][int(index)])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"Window {label} has candidates 0-{len(entry['candidates']) - 1}; "
+                           f"got '{index}'.") from None
+    return plan_path, plan, entry, candidate
+
+
+def _from_candidate_window(args, argv, input_path):
+    """Point args at the plan window --from_candidate names. Returns the loaded parts."""
+    if args.autotune:
+        raise RuntimeError("--from_candidate and --autotune both choose the settings; "
+                           "use one.")
+    clash = [o for o in AUTOTUNED_OPTIONS if _explicit(argv, o)]
+    if clash:
+        raise RuntimeError(f"--from_candidate sets {', '.join(clash)} itself; drop them.")
+    plan_path, plan, entry, candidate = load_candidate(*args.from_candidate)
+    if os.path.abspath(plan.get("source", "")) != input_path:
+        raise RuntimeError(f"{plan_path} was tuned on {plan.get('source')}, "
+                           f"not {input_path}.")
+    start, length = entry["start_sec"], entry["end_sec"] - entry["start_sec"]
+    for option, value, wanted in (("--skip_first_n_sec", args.skip_first_n_sec, start),
+                                  ("--process_n_seconds", args.process_n_seconds, length)):
+        if _explicit(argv, option) and value is not None and abs(value - wanted) > 1e-3:
+            raise RuntimeError(f"{option} disagrees with window {entry['label']}; "
+                               f"--from_candidate sets the window itself.")
+    args.skip_first_n_sec, args.process_n_seconds = start, length
+    args.separate_music = bool((plan.get("grid") or {}).get("separate_music"))
+    return plan_path, entry, candidate
+
+
+def _from_candidate(args, loaded):
+    plan_path, entry, candidate = loaded
+    _apply_candidate(args, candidate)
+    index = int(args.from_candidate[2])
+    print_success(f"Using candidate {index} of {entry['label']}: {candidate.describe()}")
+    record = _tuning_record(plan_path, entry, candidate)
+    record.update(chosen_by="user", candidate_index=index,
+                  autotune_pick={k: entry["picked"].get(k) for k in _PICK_FIELDS})
+    return record
 
 
 def _stage_chain(args, o, compare_mode, audio_only, auto_loudness=False):
@@ -588,6 +667,12 @@ def _run(args, argv=None):
         raise RuntimeError("--tag labels the automatic name; with -o, write the label into "
                            "the name yourself (or drop -o).")
 
+    from_candidate = None
+    if args.from_candidate:
+        from_candidate = _from_candidate_window(args, argv or [], input_path)
+    if args.keep_candidates and not args.autotune:
+        print_warning("--keep_candidates only applies with --autotune.")
+
     keep_temp_dir = None
     if args.keep_temp:
         keep_temp_dir = os.path.abspath(os.path.expanduser(args.keep_temp))
@@ -664,7 +749,8 @@ def _run(args, argv=None):
     print_info(f"Input Video:  {input_path}")
     print_info(f"Output Dir:   {output_dir}")
     print_info(f"Output File:  {os.path.basename(output_path)}")
-    if os.path.exists(output_path):
+    replacing = os.path.exists(output_path)
+    if replacing:
         from .provenance import sidecar_path
         replaced = [os.path.basename(output_path)]
         if os.path.exists(sidecar_path(output_path)):
@@ -691,12 +777,15 @@ def _run(args, argv=None):
             tune_length = max(0.0, file_duration - requested_start)
         results["autotune"] = _autotune(args, argv or [], input_path, output_dir,
                                         requested_start, tune_length)
+    elif from_candidate:
+        results["autotune"] = _from_candidate(args, from_candidate)
 
     # Loudness target: a number, or chosen from the cleaned audio ('auto').
     # --autotune implies auto unless the user set a target themselves.
     auto_loudness = args.normalize and (
         args.target_lufs == "auto"
-        or (args.autotune and not _explicit(argv or [], "--target_lufs")))
+        or ((args.autotune or args.from_candidate)
+            and not _explicit(argv or [], "--target_lufs")))
     if auto_loudness:
         args.target_lufs = args.target_lufs_max      # provisional, for the first measurement
 
@@ -872,8 +961,11 @@ def _run(args, argv=None):
         if keep_temp_dir:
             _copy_intermediates(temp_dir, keep_temp_dir)
 
-        _write_sidecar(output_path, args, input_path, output_dir, requested_start,
-                       requested_duration, actual_start, actual_duration, results)
+        sidecar = _write_sidecar(output_path, args, input_path, output_dir, requested_start,
+                                 requested_duration, actual_start, actual_duration, results)
+        events.emit("result", output=output_path,
+                    sidecar=None if sidecar is None else str(sidecar),
+                    replaced=replacing, results=results)
         print_success(f"Processing complete! Saved to: {output_path}")
         if compare_mode:
             print_success(f"A/B preview (original → 0.5s silence → processed):\n"
@@ -905,6 +997,8 @@ def _write_sidecar(output_path, args, input_path, output_dir, requested_start,
     # the reproduce command renders the same file without tuning again.
     resolved.autotune = False
     resolved.autotune_dir = None
+    resolved.keep_candidates = False
+    resolved.from_candidate = None
     resolved.input_video = input_path
     resolved.output_dir = output_dir
     resolved.output = os.path.basename(output_path)
@@ -919,8 +1013,10 @@ def _write_sidecar(output_path, args, input_path, output_dir, requested_start,
     try:
         path = provenance.write(output_path, build_parser(), resolved, window, results)
         print_info(f"Parameters recorded in {path.name}")
+        return path
     except OSError as exc:
         print_warning(f"Could not write the parameters file: {exc}")
+        return None
 
 
 def _copy_intermediates(temp_dir, keep_temp_dir):
@@ -999,6 +1095,11 @@ def main():
     procs.install_signal_handlers()
     args = build_parser().parse_args()
     ffmpeg_utils.VERBOSE = args.verbose
+    with events.session("clean-audio", sys.argv[1:], args.progress):
+        _main(args)
+
+
+def _main(args):
     try:
         _run(args, sys.argv[1:])
     except KeyboardInterrupt:

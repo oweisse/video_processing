@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0
+
+**Added**
+- `clean-audio-gui`: a desktop GUI (local web UI in a native window, `--browser` for a
+  browser tab) over an output folder. Library of sources and outputs, a synced A/B
+  player to compare original and cleaned (instant gapless switching, level-matched,
+  loops), audition of every tuning candidate, a run form that shows the command it
+  runs, and a job queue with progress, cancel and logs. See the README and
+  `docs/gui-design.md`.
+- `--progress json` (clean-audio, clean-audio-tune): one JSON event per line on stdout
+  (steps, progress, messages, tuning candidates, the result); everything else goes to
+  stderr. Not recorded in `.params.json`.
+- `clean-audio-tune --keep_candidates` and `clean-audio --autotune --keep_candidates`
+  keep every candidate's audio (AAC) and its loudness in the tuning cache. A window
+  tuned earlier without it is measured again when the tool is asked to keep them.
+- `clean-audio --from_candidate PLAN WINDOW INDEX` renders one tuned candidate instead
+  of autotune's pick; the sidecar records `chosen_by: user` and autotune's own pick.
+- A window's pick can be set by hand (GUI *Make it the pick*); it survives rescoring
+  and is what `--autotune` and `clean-audio-batch` use for that window.
+- `python -m video_audio_cleaner.probe FILE`: codecs, size, frame rate, keyframe spacing.
+- Editing (GUI *Edit*): projects of clips from one or more videos, with cleaned sound
+  where it exists, crossfades, and a music bed ducked under speech. Timeline with
+  thumbnails, trim, reorder, split, undo; a program player over 540p proxies.
+- `clean-audio-export PROJECT.json`: renders an edit to one MP4 (H.264 + AAC, faststart).
+  Stream-copies the video when every cut is on a keyframe of one source; otherwise
+  scales, pads and re-encodes (libx264, or `h264_videotoolbox`). Loudness by a measured
+  gain and a true-peak limiter. `--plan` says whether it would be lossless.
+- `python -m video_audio_cleaner.prep proxy|thumbs|peaks`: the editing proxy,
+  timeline thumbnails and waveform peaks for a source.
+
 ## 0.4.0
 
 **Added**

@@ -83,7 +83,18 @@ echo -e "${COLOR_BLUE}Upgrading pip ...${COLOR_RESET}"
 # 4. Install the project (with Demucs separation extra)
 # ---------------------------------------------------------------------------
 echo -e "${COLOR_BLUE}Installing video-audio-cleaner and dependencies (this downloads PyTorch; it takes a few minutes) ...${COLOR_RESET}"
-./venv/bin/pip install -e ".[separation,dev]"
+./venv/bin/pip install -e ".[separation,gui,dev]"
+
+# ---------------------------------------------------------------------------
+# GUI frontend (clean-audio-gui). Needs Node.js 20+; the CLIs work without it.
+# ---------------------------------------------------------------------------
+if command -v npm &> /dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 20 ]; then
+    echo -e "${COLOR_BLUE}Building the GUI frontend ...${COLOR_RESET}"
+    (cd gui && npm ci --no-audit --no-fund --loglevel=error && npm run build --silent)
+    echo -e "${COLOR_GREEN}✔ GUI built.${COLOR_RESET}"
+else
+    echo -e "${COLOR_YELLOW}Node.js 20+ not found: skipping the GUI frontend (brew install node, then rerun).${COLOR_RESET}"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Smoke test
@@ -101,6 +112,7 @@ print("  Metal (MPS) available:", torch.backends.mps.is_available())
 PY
 
 echo -e "\n${COLOR_BOLD}${COLOR_GREEN}✔ Setup completed successfully!${COLOR_RESET}"
+echo -e "\nOpen the GUI:  ${COLOR_BOLD}./venv/bin/clean-audio-gui${COLOR_RESET}"
 echo -e "\nRun the tool with either:"
 echo -e "  ${COLOR_BOLD}./venv/bin/clean-audio --help${COLOR_RESET}"
 echo -e "or activate the environment first:"
