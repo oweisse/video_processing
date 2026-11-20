@@ -19,7 +19,7 @@ from pathlib import Path
 from .. import memory
 
 # Heavy jobs share one lane; preparing sources (ffmpeg, light) runs beside them.
-ML_TYPES = {"clean", "clean_candidate", "tune", "export", "export_estimate"}
+ML_TYPES = {"clean", "clean_candidate", "tune", "export", "export_estimate", "subtitles", "subtitles_translate"}
 MAX_MESSAGES = 40
 CANCEL_LADDER = ((signal.SIGINT, 5.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0))
 ACTIVE = ("queued", "running")

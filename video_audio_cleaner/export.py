@@ -885,6 +885,7 @@ def run(project_path, out=None, force_encode=False, overrides=None):
             cmd = encode_command(project, s, partial, measured, p["canvas"])
             ffmpeg_utils.run_ffmpeg(cmd, total, "Encoding")
             commands = [cmd]
+        subtitle_info = add_subtitles(partial, project, project_path, s, work)
         os.replace(partial, out)
         procs.unregister_path(str(partial))
     finally:
@@ -895,6 +896,8 @@ def run(project_path, out=None, force_encode=False, overrides=None):
     result = base_result(p, s, measured)
     if verified is not None:
         result["copy_verified"] = verified
+    if subtitle_info:
+        result["subtitles"] = subtitle_result(subtitle_info, write_subtitle_files(out, subtitle_info))
     finish(out, project_path, project, commands, result)
     return out, result
 
@@ -939,6 +942,113 @@ def base_result(p, s, measured):
             "canvas": p["canvas"], "measured_lufs": measured[0],
             "measured_true_peak_dbtp": measured[1], "gain_db": round(gain_db(s, measured), 2),
             "target_lufs": float(s["target_lufs"])}
+
+
+# ------------------------------------------------------------------ subtitles (docs/subtitles-plan.md §10)
+SUB_TAGS = {"mixed": ("mul", "Original (spoken)"), "en": ("eng", "English"), "he": ("heb", "Hebrew")}
+
+
+def subtitle_request(s):
+    """{"srt": [...], "tracks": [...], "default": lang|None} from export.subtitles, or None."""
+    from . import subs
+    sub = s.get("subtitles") or {}
+    srt = [x for x in sub.get("srt") or [] if x in subs.LANGS]
+    tracks = [x for x in sub.get("tracks") or [] if x in subs.LANGS]
+    if not srt and not tracks:
+        return None
+    default = sub.get("default_track") if sub.get("default_track") in tracks else None
+    return {"srt": srt, "tracks": tracks, "default": default}
+
+
+def library_of(project_path):
+    """The library folder a project lives in (…/_projects/<name>/project.json)."""
+    p = Path(project_path).resolve()
+    return p.parents[2] if p.parent.parent.name == "_projects" else p.parent
+
+
+def add_subtitles(partial, project, project_path, s, work):
+    """Embed the requested subtitle tracks into `partial` (a stream-copy remux) and prepare
+    the .srt files; returns what write_subtitle_files needs and the report, or None."""
+    from . import subs
+    req = subtitle_request(s)
+    if req is None:
+        return None
+    lib = Path(s.get("subtitles_dir")) if s.get("subtitles_dir") else subs.docs_dir(library_of(project_path))
+    cs = (project.get("tracks") or {}).get("video") or []
+    docs = {}
+    for sid in {c["source"] for c in cs}:
+        p = lib / sid / "subtitles.json"
+        docs[sid] = subs.load(p) if p.is_file() else subs.empty(sid)
+    wanted = list(dict.fromkeys(req["tracks"] + req["srt"]))
+    texts, report = {}, {}
+    for lang in wanted:
+        items = subs.timeline_cues(cs, docs, lang)
+        report[lang] = subs.completeness(cs, docs, lang)
+        if not items:
+            print_warning(f"No {SUB_TAGS[lang][1].lower()} subtitles on the timeline; left out.")
+            continue
+        texts[lang] = subs.to_srt(items)
+        c = report[lang]
+        print_info(f"{SUB_TAGS[lang][1]} subtitles: {c['cues']} lines"
+                   + (f", {c['missing']} not translated (shown as spoken)" if lang != "mixed" and c["missing"] else "")
+                   + (f", {c['stale']} out of date" if c["stale"] else "")
+                   + (f"; {c['uncovered_sec']:.0f} s of the video has none" if c["uncovered_sec"] >= 1 else ""))
+    tracks = [lang for lang in req["tracks"] if lang in texts]
+    if tracks:
+        files = []
+        for lang in tracks:
+            f = Path(work) / f"{lang}.srt"
+            f.write_text(texts[lang], encoding="utf-8")
+            files.append(f)
+        out2 = Path(partial).with_name(Path(partial).stem + ".subs" + Path(partial).suffix)
+        procs.register_path(str(out2))
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(partial)]
+        for f in files:
+            cmd += ["-f", "srt", "-i", str(f)]
+        cmd += ["-map", "0:v:0", "-map", "0:a:0"]
+        for k in range(len(files)):
+            cmd += ["-map", f"{k + 1}:0"]
+        cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"]
+        if _video_codec(partial) == "hevc":
+            cmd += ["-tag:v", "hvc1"]
+        for k, lang in enumerate(tracks):
+            code, title = SUB_TAGS[lang]
+            cmd += [f"-metadata:s:s:{k}", f"language={code}", f"-metadata:s:s:{k}", f"title={title}",
+                    f"-disposition:s:{k}", "default" if lang == req["default"] else "0"]
+        cmd += ["-movflags", "+faststart", str(out2)]
+        ffmpeg_utils.run_ffmpeg(cmd, None, "Adding subtitles")
+        os.replace(out2, partial)
+        procs.unregister_path(str(out2))
+    return {"texts": {lang: texts[lang] for lang in req["srt"] if lang in texts}, "tracks": tracks,
+            "report": report}
+
+
+def _video_codec(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                              "stream=codec_name", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        return out
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def write_subtitle_files(out, info):
+    """Name.mixed.srt, Name.en.srt, Name.he.srt beside the exported video; returns the paths."""
+    if not info:
+        return []
+    paths = []
+    for lang, text in info["texts"].items():
+        p = Path(out).with_name(f"{Path(out).stem}.{lang}.srt")
+        tmp = p.with_name(p.name + ".partial")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, p)
+        paths.append(str(p))
+    return paths
+
+
+def subtitle_result(info, paths):
+    return {"tracks": info["tracks"], "srt": paths, "completeness": info["report"]} if info else None
 
 
 def finish(out, project_path, project, commands, result):
@@ -991,6 +1101,13 @@ def build_parser():
     size.add_argument("--estimate", action="store_true",
                       help="Only try the samples: print the estimate and write "
                            "estimate.json beside the project. No video is written.")
+    sub = p.add_argument_group("subtitles (docs/subtitles-plan.md §10)")
+    sub.add_argument("--subtitles_srt", default=None, metavar="LANGS",
+                     help="Write .srt files beside the video: mixed,en,he (or none). Default: the project's.")
+    sub.add_argument("--subtitle_tracks", default=None, metavar="LANGS",
+                     help="Embed selectable subtitle tracks: mixed,en,he (or none). Default: the project's.")
+    sub.add_argument("--subtitles_dir", default=None,
+                     help="Where the subtitle documents are (default: the library's _subtitles).")
     events.add_argument(p)
     return p
 
@@ -1000,8 +1117,13 @@ def overrides_of(args):
     from . import sizing
     budget = (sizing.parse_budget(args.budget) if args.budget else
               sizing.parse_size(args.size) if args.size else None)
+    subtitles = None
+    if args.subtitles_srt is not None or args.subtitle_tracks is not None:
+        pick = lambda v: [] if v in (None, "none") else [x.strip() for x in v.split(",") if x.strip()]
+        subtitles = {"srt": pick(args.subtitles_srt), "tracks": pick(args.subtitle_tracks)}
     return {"budget": budget, "codec": args.codec, "height": args.height,
-            "fast": args.fast, "one_pass": args.one_pass}
+            "fast": args.fast, "one_pass": args.one_pass, "subtitles": subtitles,
+            "subtitles_dir": args.subtitles_dir}
 
 
 def main(argv=None):

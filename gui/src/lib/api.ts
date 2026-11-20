@@ -1,4 +1,5 @@
 // Typed access to the clean-audio-gui server (docs/gui-design.md §5.6).
+import type { Cue, SubtitleDoc } from "./subtitles";
 
 export type SourceKind = "tape" | "digital";
 
@@ -130,6 +131,22 @@ export interface StorageUsage {
   trash: number;
 }
 
+export type SubtitleOp =
+  | { op: "text"; id: string; text: string; lang?: "mixed" | "en" | "he" }
+  | { op: "time"; id: string; start: number; end: number }
+  | { op: "split"; id: string; at_char?: number; at_sec?: number }
+  | { op: "merge"; id: string }
+  | { op: "delete"; id: string }
+  | { op: "add"; start: number; end: number; text: string }
+  | { op: "clear_tr"; id: string; lang: "en" | "he" }
+  | { op: "delete_range"; start: number; end: number }
+  | { op: "put"; cue: Cue }
+  | { op: "cover"; start: number; end: number };
+
+export interface SubtitlesSetupItem { ok: boolean; label: string; detail: string; command: string; optional?: boolean }
+export type SubtitlesSetup = Record<string, SubtitlesSetupItem> & { ready: { transcribe: boolean; translate: boolean } };
+export interface SubtitleCompleteness { cues: number; missing: number; stale: number; translated: number; uncovered_sec: number }
+
 export interface Plan {
   path: string;
   dir: string;
@@ -151,6 +168,10 @@ export interface Source {
   source_kind: SourceKind | null;
   probe: Probe | null;
   prep?: { proxy: boolean; thumbs: boolean; peaks: boolean };
+  subtitles?: {
+    rev: number; coverage: [number, number][]; cues: number; edited: number; flagged: number;
+    langs: Record<"en" | "he", { done: number; of: number; stale: number }>;
+  } | null;
 }
 
 export interface ProjectSummary {
@@ -304,6 +325,14 @@ const q = (params: Record<string, string | number | null | undefined>) =>
 export const api = {
   candidateSettings: (plan: string, window: string, index: number) =>
     call<CandidateSettings>("GET", `/api/plans/candidate_settings?${q({ plan, window, index: String(index) })}`),
+  subtitles: (sourceId: string) => call<SubtitleDoc>("GET", `/api/subtitles/${encodeURIComponent(sourceId)}`),
+  editSubtitles: (sourceId: string, ops: SubtitleOp[]) =>
+    call<{ rev: number; cues: Cue[]; removed: string[]; coverage: [number, number][] }>("POST", `/api/subtitles/${encodeURIComponent(sourceId)}/edit`, { ops }),
+  subtitlesSetup: (fresh = false) => call<SubtitlesSetup>("GET", `/api/subtitles/setup${fresh ? "?fresh=true" : ""}`),
+  glossary: () => call<{ he: string; en: string }[]>("GET", "/api/subtitles/glossary"),
+  saveGlossary: (items: { he: string; en: string }[]) => call<{ he: string; en: string }[]>("PUT", "/api/subtitles/glossary", items),
+  projectSubtitles: (name: string) =>
+    call<{ completeness: Record<"mixed" | "en" | "he", SubtitleCompleteness> }>("GET", `/api/projects/${encodeURIComponent(name)}/subtitles?lang=all`),
   appInfo: () => call<{ native: boolean; version: string }>("GET", "/api/app"),
   memory: () => call<{ used: number | null; budget: number | null; total: number | null; machine_used: number | null }>("GET", "/api/memory"),
   pick: (kind: "file" | "dir" | "audio", start?: string, multiple = false) =>

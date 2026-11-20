@@ -178,3 +178,33 @@ def cli_schema():
                     "help": a.help, "group": groups.get(a.dest),
                     "autotuned": flag in cli.AUTOTUNED_OPTIONS})
     return out
+
+
+# ------------------------------------------------------------------ subtitles
+def subtitles_argv(source_path, output_dir, source_id, start, end, replace="missing", model="large-v3",
+                   language="auto", audio=None, audio_start=0.0, channel="mix"):
+    from .. import subtitles_cli
+    args = ["transcribe", str(source_path), "--output_dir", str(output_dir), "--id", source_id,
+            "--start", seconds(start), "--end", seconds(end), "--replace", replace, "--model", model,
+            "--language", language, "--channel", channel, "--progress", "json"]
+    if audio:
+        args += ["--audio", str(audio), "--audio_start", seconds(audio_start)]
+    _check(subtitles_cli.build_parser(), args)
+    return [PYTHON, "-m", "video_audio_cleaner.subtitles_cli", *args]
+
+
+def translate_argv(output_dir, source_id, to, start=None, end=None, mode="missing", replace_edited=False):
+    from .. import subtitles_cli
+    args = ["translate", "--output_dir", str(output_dir), "--id", source_id, "--to", to, "--mode", mode,
+            "--progress", "json"]
+    if start is not None and end is not None:
+        args += ["--start", seconds(start), "--end", seconds(end)]
+    if replace_edited:
+        args.append("--replace_edited")
+    _check(subtitles_cli.build_parser(), args)
+    return [PYTHON, "-m", "video_audio_cleaner.subtitles_cli", *args]
+
+
+def subtitles_setup_argv(what):
+    args = ["setup", "--download", what, "--progress", "json"]
+    return [PYTHON, "-m", "video_audio_cleaner.subtitles_cli", *args]

@@ -1,0 +1,331 @@
+{
+ "docs": {
+  "s": {
+   "cues": [
+    {
+     "id": "c1",
+     "start": 12.0,
+     "end": 14.0,
+     "text": "שלום everyone",
+     "lang": "mixed",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {
+      "en": {
+       "text": "Hello everyone",
+       "src": "שלום everyone"
+      }
+     }
+    },
+    {
+     "id": "c2",
+     "start": 19.2,
+     "end": 21.0,
+     "text": "edge of the clip",
+     "lang": "en",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {}
+    },
+    {
+     "id": "c3",
+     "start": 41.0,
+     "end": 43.0,
+     "text": "hello there",
+     "lang": "en",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {}
+    },
+    {
+     "id": "c4",
+     "start": 44.0,
+     "end": 46.0,
+     "text": "מה שלומכם",
+     "lang": "he",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {
+      "en": {
+       "text": "How are you",
+       "src": "an older version of the line"
+      }
+     }
+    },
+    {
+     "id": "c5",
+     "start": 49.8,
+     "end": 52.0,
+     "text": "cut by the clip end",
+     "lang": "en",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {}
+    }
+   ],
+   "coverage": [
+    [
+     10,
+     22
+    ],
+    [
+     38,
+     55
+    ]
+   ]
+  },
+  "t": {
+   "cues": [
+    {
+     "id": "d1",
+     "start": 5.0,
+     "end": 7.0,
+     "text": "another video",
+     "lang": "en",
+     "run": null,
+     "edited": false,
+     "flags": [],
+     "tr": {}
+    }
+   ],
+   "coverage": [
+    [
+     0,
+     10
+    ]
+   ]
+  }
+ },
+ "cases": [
+  {
+   "name": "two clips with a crossfade",
+   "clips": [
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20
+    },
+    {
+     "id": "b",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 50,
+     "transition_in": {
+      "type": "crossfade",
+      "sec": 1
+     }
+    }
+   ],
+   "lang": "mixed",
+   "expect": [
+    [
+     2.0,
+     4.0,
+     "שלום everyone",
+     "c1"
+    ],
+    [
+     10.0,
+     12.0,
+     "hello there",
+     "c3"
+    ],
+    [
+     13.0,
+     15.0,
+     "מה שלומכם",
+     "c4"
+    ]
+   ]
+  },
+  {
+   "name": "english track: translated, already english, stale, missing",
+   "clips": [
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20
+    },
+    {
+     "id": "b",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 50,
+     "transition_in": {
+      "type": "crossfade",
+      "sec": 1
+     }
+    }
+   ],
+   "lang": "en",
+   "expect": [
+    [
+     2.0,
+     4.0,
+     "Hello everyone",
+     "c1",
+     false,
+     false
+    ],
+    [
+     10.0,
+     12.0,
+     "hello there",
+     "c3",
+     false,
+     false
+    ],
+    [
+     13.0,
+     15.0,
+     "How are you",
+     "c4",
+     false,
+     true
+    ]
+   ]
+  },
+  {
+   "name": "hebrew track falls back to the spoken text",
+   "clips": [
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20
+    }
+   ],
+   "lang": "he",
+   "expect": [
+    [
+     2.0,
+     4.0,
+     "שלום everyone",
+     "c1",
+     true,
+     false
+    ],
+    [
+     9.2,
+     10.0,
+     "edge of the clip",
+     "c2",
+     true,
+     false
+    ]
+   ]
+  },
+  {
+   "name": "a cue cut by the clip's end keeps the visible part",
+   "clips": [
+    {
+     "id": "b",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 51
+    }
+   ],
+   "lang": "mixed",
+   "expect": [
+    [
+     1.0,
+     3.0,
+     "hello there",
+     "c3"
+    ],
+    [
+     4.0,
+     6.0,
+     "מה שלומכם",
+     "c4"
+    ],
+    [
+     9.8,
+     11.0,
+     "cut by the clip end",
+     "c5"
+    ]
+   ]
+  },
+  {
+   "name": "reordered clips from two videos, a muted clip",
+   "clips": [
+    {
+     "id": "x",
+     "source": "t",
+     "in_sec": 4,
+     "out_sec": 8
+    },
+    {
+     "id": "m",
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": {
+      "mute": true
+     }
+    },
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 44
+    }
+   ],
+   "lang": "mixed",
+   "expect": [
+    [
+     1.0,
+     3.0,
+     "another video",
+     "d1"
+    ],
+    [
+     15.0,
+     17.0,
+     "hello there",
+     "c3"
+    ]
+   ]
+  },
+  {
+   "name": "a line across a split shot stays one subtitle",
+   "clips": [
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 45.0
+    },
+    {
+     "id": "b",
+     "source": "s",
+     "in_sec": 45.0,
+     "out_sec": 50
+    }
+   ],
+   "lang": "mixed",
+   "expect": [
+    [
+     1.0,
+     3.0,
+     "hello there",
+     "c3"
+    ],
+    [
+     4.0,
+     6.0,
+     "מה שלומכם",
+     "c4"
+    ]
+   ]
+  }
+ ]
+}

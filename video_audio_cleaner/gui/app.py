@@ -267,6 +267,98 @@ def create_app(output_dir=None, dialogs=None):
                 used.append({"project": item["name"], "clips": n})
         return {"used_by": used}
 
+    # -------------------------------------------------------------- subtitles
+    _setup_cache = {"at": 0.0, "value": None}
+
+    @app.get("/api/subtitles/setup")
+    async def subtitles_setup(fresh: bool = False):
+        from .. import subtitles_cli
+        if fresh or time.time() - _setup_cache["at"] > 30 or _setup_cache["value"] is None:
+            _setup_cache["value"] = await asyncio.to_thread(subtitles_cli.check)
+            _setup_cache["at"] = time.time()
+        return _setup_cache["value"]
+
+    def _subs_path(source_id):
+        from .. import subs
+        if lib().source(source_id) is None:
+            raise HTTPException(404, "Unknown source")
+        return subs.doc_path(lib().output_dir, source_id)
+
+    @app.get("/api/subtitles/glossary")
+    def get_glossary():
+        from .. import subs
+        return subs.load_glossary(lib().output_dir)
+
+    @app.put("/api/subtitles/glossary")
+    def put_glossary(body: list = Body(...)):
+        from .. import subs
+        return subs.save_glossary(lib().output_dir, body)
+
+    @app.get("/api/subtitles/{source_id}")
+    def get_subtitles(source_id: str, start: Optional[float] = None, end: Optional[float] = None):
+        from .. import subs
+        doc = subs.load(_subs_path(source_id))
+        if start is not None and end is not None:
+            doc = {**doc, "cues": [c for c in doc["cues"] if c["end"] > start and c["start"] < end]}
+        return doc
+
+    @app.post("/api/subtitles/{source_id}/edit")
+    def edit_subtitles(source_id: str, body: dict = Body(...)):
+        """Edits applied in order under the document's lock; all or none."""
+        from .. import subs
+        ops = body.get("ops") or []
+        path = _subs_path(source_id)
+        before = {c["id"]: c for c in subs.load(path)["cues"]}
+
+        def apply(doc):
+            for op in ops:
+                subs.apply_op(doc, op)
+        try:
+            subs.update(path, apply)
+        except KeyError as exc:
+            raise HTTPException(404, f"No subtitle {exc.args[0]}; reload and try again")
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        doc = subs.load(path)
+        src = lib().source(source_id)
+        if src is not None:          # the library's cached summary follows the edit
+            src["subtitles"] = subs.summary(doc)
+        after = {c["id"]: c for c in doc["cues"]}
+        changed = [c for i, c in after.items() if before.get(i) != c]
+        return {"rev": doc["rev"], "cues": changed, "removed": [i for i in before if i not in after],
+                "coverage": doc.get("coverage") or []}
+
+    def _project_subtitles(name):
+        from .. import subs
+        project = projects.load(lib().output_dir, name)
+        clips = (project.get("tracks") or {}).get("video") or []
+        docs = {sid: subs.load(subs.doc_path(lib().output_dir, sid)) for sid in {c["source"] for c in clips}}
+        return clips, docs
+
+    @app.get("/api/projects/{name}/subtitles")
+    def project_subtitles(name: str, lang: str = "mixed"):
+        from .. import subs
+        if not projects.path(lib().output_dir, name).is_file():
+            raise HTTPException(404, "Unknown project")
+        clips, docs = _project_subtitles(name)
+        if lang == "all":
+            return {"completeness": {lg: subs.completeness(clips, docs, lg) for lg in subs.LANGS}}
+        if lang not in subs.LANGS:
+            raise HTTPException(422, "lang is mixed, en, he or all")
+        return {"items": subs.timeline_cues(clips, docs, lang), "completeness": subs.completeness(clips, docs, lang)}
+
+    @app.get("/api/projects/{name}/subtitles.srt")
+    def project_subtitles_srt(name: str, lang: str = "mixed"):
+        from .. import subs
+        if not projects.path(lib().output_dir, name).is_file():
+            raise HTTPException(404, "Unknown project")
+        if lang not in subs.LANGS:
+            raise HTTPException(422, "lang is mixed, en or he")
+        clips, docs = _project_subtitles(name)
+        body = subs.to_srt(subs.timeline_cues(clips, docs, lang))
+        return PlainTextResponse(body, media_type="application/x-subrip",
+                                 headers={"Content-Disposition": f'attachment; filename="{lang}.srt"'})
+
     @app.get("/api/storage")
     async def storage_usage(project: Optional[str] = None):
         """Disk used per video (original, editing copies, tuning audio, rendered versions),
@@ -511,6 +603,50 @@ def create_app(output_dir=None, dialogs=None):
                                           source["id"], kinds)
                 title = f"Prepare {source['name']} for editing"
                 meta = {"source_id": source["id"], "kinds": kinds, "memory_gb": memory.LIGHT_JOB_GB}
+            elif kind == "subtitles":
+                source = _source(body.get("source_id") or "")
+                start = float(body.get("start_sec") or 0.0)
+                dur = body.get("duration_sec")
+                end = start + float(dur) if dur else float((source.get("probe") or {}).get("duration_sec") or 0)
+                if end <= start:
+                    raise ValueError("Choose a stretch to transcribe")
+                audio, audio_start = None, 0.0
+                choice = body.get("audio") or "original"
+                if choice != "original":
+                    out = lib().output(choice)
+                    if out is None or not out.get("exists"):
+                        raise ValueError("That cleaned version is gone")
+                    audio, audio_start = out["path"], float((out.get("window") or {}).get("actual_start_sec") or 0)
+                argv = commands.subtitles_argv(source["path"], out_dir, source["id"], start, end,
+                                               body.get("replace") or "missing", body.get("model") or "large-v3",
+                                               body.get("language") or "auto", audio, audio_start,
+                                               body.get("channel") or "mix")
+                title = f"Subtitles for {source['name']} {_fmt_window(start, end - start)}"
+                meta = {"source_id": source["id"], "start_sec": start, "duration_sec": end - start,
+                        "memory_gb": memory.SUBTITLES_GB}
+            elif kind == "subtitles_translate":
+                source = _source(body.get("source_id") or "")
+                to = body.get("to")
+                if to not in ("en", "he"):
+                    raise ValueError("Translate into en or he")
+                start = body.get("start_sec")
+                dur = body.get("duration_sec")
+                end = float(start) + float(dur) if start is not None and dur else None
+                argv = commands.translate_argv(out_dir, source["id"], to, start, end,
+                                               body.get("mode") or "missing", bool(body.get("replace_edited")))
+                title = f"Translate {source['name']} to {'English' if to == 'en' else 'Hebrew'}" + \
+                        (f" {_fmt_window(float(start), float(dur))}" if end is not None else "")
+                meta = {"source_id": source["id"], "to": to, "start_sec": start, "duration_sec": dur,
+                        "memory_gb": memory.TRANSLATE_GB}
+            elif kind == "subtitles_setup":
+                what = body.get("what")
+                if what not in ("whisper", "ivrit", "translate"):
+                    raise ValueError("Download whisper, ivrit or translate")
+                argv = commands.subtitles_setup_argv(what)
+                title = {"whisper": "Download the speech recognition model",
+                         "ivrit": "Download the Hebrew-tuned speech model",
+                         "translate": "Download the translation model"}[what]
+                meta = {"what": what, "memory_gb": 0.5}
             elif kind in ("export", "export_estimate"):
                 name = body.get("project") or ""
                 path = projects.path(out_dir, name)

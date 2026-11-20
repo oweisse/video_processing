@@ -2,7 +2,7 @@
   // Export settings for one project: keep the original quality, or fit a size (budget,
   // format, picture height, hardware encoder); an Estimate (samples, a job) and Export.
   // Used by Deliver and by the editor's Export dialog (docs/stitch-and-size-budget-plan.md §11).
-  import { api, type ExportPlan, type SizeEstimate } from "../lib/api";
+  import { api, type ExportPlan, type SizeEstimate, type SubtitleCompleteness } from "../lib/api";
   import { ltr } from "../lib/bidi";
   import { displayWidth, type Project } from "../lib/edit";
   import { queued, reportError, store } from "../lib/state.svelte";
@@ -48,6 +48,32 @@
       reportError(e);
     }
   }
+  // Subtitles in the export (docs/subtitles-plan.md §10.3)
+  const SUB_LANGS = [["mixed", "Mixed"], ["en", "English only"], ["he", "Hebrew only"]] as const;
+  type SubSetting = { srt: string[]; tracks: string[]; default_track: string | null };
+  const subSetting = $derived<SubSetting>({ srt: [], tracks: [], default_track: null, ...((project.export as any).subtitles ?? {}) });
+  let subDone = $state<Record<"mixed" | "en" | "he", SubtitleCompleteness> | null>(null);
+  $effect(() => {
+    void name;
+    void project.tracks.video.length;
+    api.projectSubtitles(name).then((r) => (subDone = r.completeness)).catch(() => (subDone = null));
+  });
+  function toggleSub(kind: "srt" | "tracks", lang: string, on: boolean) {
+    commit((p) => {
+      const cur: SubSetting = { srt: [], tracks: [], default_track: null, ...((p.export as any).subtitles ?? {}) };
+      cur[kind] = on ? [...new Set([...cur[kind], lang])] : cur[kind].filter((x) => x !== lang);
+      if (cur.default_track && !cur.tracks.includes(cur.default_track)) cur.default_track = null;
+      (p.export as any).subtitles = cur;
+    });
+  }
+  function setSubDefault(v: string) {
+    commit((p) => {
+      const cur: SubSetting = { srt: [], tracks: [], default_track: null, ...((p.export as any).subtitles ?? {}) };
+      cur.default_track = v || null;
+      (p.export as any).subtitles = cur;
+    });
+  }
+
   // Settings changed (saved first): ask again whether the saved estimate still holds.
   let timer: ReturnType<typeof setTimeout> | undefined;
   function change(mutate: (p: Project) => void) {
@@ -131,6 +157,7 @@
   }
   const metricName = (e: SizeEstimate) => (e.metric === "ssim" ? "SSIM" : "VMAF");
 </script>
+
 
 {#if !plan}
   <p class="dim">Checking the cuts…</p>
@@ -232,6 +259,35 @@
       </div>
     {/if}
 
+    <div class="subs col">
+      <div class="row"><b>Subtitles</b><span class="faint small">separate .srt files beside the video, and/or tracks inside it that viewers can switch on</span></div>
+      <table class="small">
+        <thead><tr><th></th><th>.srt file</th><th>Track in the video</th><th></th></tr></thead>
+        <tbody>
+          {#each SUB_LANGS as [lang, label] (lang)}
+            {@const c = subDone?.[lang]}
+            <tr>
+              <td>{label}</td>
+              <td><input type="checkbox" checked={subSetting.srt.includes(lang)} onchange={(e) => toggleSub("srt", lang, (e.target as HTMLInputElement).checked)} /></td>
+              <td><input type="checkbox" checked={subSetting.tracks.includes(lang)} onchange={(e) => toggleSub("tracks", lang, (e.target as HTMLInputElement).checked)} /></td>
+              <td class="faint">{!c ? "" : !c.cues ? "none yet" : `${c.cues} lines` + (lang !== "mixed" && c.missing ? ` · ${c.missing} not translated (shown as spoken)` : "") + (c.stale ? ` · ${c.stale} out of date` : "")}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      {#if subSetting.tracks.length > 1}
+        <label class="field small">Shown when the video opens
+          <select value={subSetting.default_track ?? ""} onchange={(e) => setSubDefault((e.target as HTMLSelectElement).value)}>
+            <option value="">None (viewers switch them on)</option>
+            {#each SUB_LANGS.filter(([l]) => subSetting.tracks.includes(l)) as [l, label] (l)}<option value={l}>{label}</option>{/each}
+          </select></label>
+      {/if}
+      {#if (subSetting.srt.length || subSetting.tracks.length) && subDone && subDone.mixed.uncovered_sec >= 1}
+        <div class="warn small">{formatDuration(subDone.mixed.uncovered_sec)} of the video has no subtitles yet: in Edit,
+          <a href="#/edit/{encodeURIComponent(name)}">Subtitles… → Generate for clips without subtitles</a>.</div>
+      {/if}
+    </div>
+
     {#if missing.length}
       <div class="err">Missing files — export is not possible:
         {#each missing as m}<div class="mono small">{ltr(m)}</div>{/each}</div>
@@ -246,6 +302,10 @@
 {/if}
 
 <style>
+  .subs { gap: 4px; padding-top: 6px; border-top: 1px solid var(--border); }
+  .subs table { border-collapse: collapse; }
+  .subs th { font-weight: 500; color: var(--text-dim); text-align: left; padding: 2px 10px 2px 0; }
+  .subs td { padding: 2px 10px 2px 0; }
   .settings { gap: 8px; }
   .indent { padding-left: 22px; gap: 6px; }
   .amount { width: 70px; }

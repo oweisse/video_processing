@@ -11,6 +11,12 @@
   import AddVideos from "../edit/AddVideos.svelte";
   import Modal from "../components/Modal.svelte";
   import StorageView from "../components/StorageView.svelte";
+  import SubtitlesPanel from "../edit/SubtitlesPanel.svelte";
+  import GenerateSubtitles, { type Stretch as SubStretch } from "../edit/GenerateSubtitles.svelte";
+  import SubtitlesSetup from "../edit/SubtitlesSetup.svelte";
+  import NamesDialog from "../edit/NamesDialog.svelte";
+  import { edit as editSubs, loadDoc, loadSetup, setTrack, subs as subtitles } from "../edit/subtitles.svelte";
+  import { clipStatus, cueAt, timelineCues, type Track } from "../lib/subtitles";
   import { deleteVersion, renameVersion as renameShared } from "../media/versions";
   import NewRun from "./NewRun.svelte";
   import Candidates from "./Candidates.svelte";
@@ -159,6 +165,10 @@
       pr.frame();
       syncSourceSound();
       time = pr.time;
+      if (playUntil !== null && (!pr.playing || time >= playUntil)) {
+        if (pr.playing) pr.pause();
+        playUntil = null;
+      }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
@@ -176,6 +186,106 @@
   });
 
   const total = $derived(project ? editDuration(project.tracks.video) : 0);
+  // ---------------------------------------------------------------- subtitles (docs/subtitles-plan.md §7)
+  let playUntil: number | null = null;
+  function playRange(from: number, to: number) {
+    srcVideo?.pause();
+    program?.seek(from);
+    playUntil = to;
+    void program?.play();
+  }
+  let lowerTab = $state<"videos" | "subtitles">(loadPref("edit.lowerTab", "videos"));
+  $effect(() => savePref("edit.lowerTab", lowerTab));
+  let generating = $state<{ stretches: SubStretch[]; again: boolean } | null>(null);
+  let showSubSetup = $state(false);
+  let showSubMenu = $state(false);
+  let showNames = $state(false);
+  // every video the project uses: its subtitles, loaded once
+  $effect(() => {
+    for (const sid of Object.keys(project?.sources ?? {})) void loadDoc(sid);
+  });
+  // while a subtitle job writes to a video of this project, show its work as it comes
+  const subJobKey = $derived(store.jobs
+    .filter((j) => j.type.startsWith("subtitles") && j.type !== "subtitles_setup" && project?.sources[j.meta?.source_id])
+    .map((j) => `${j.meta.source_id}:${j.state}:${j.progress?.processed_sec ?? ""}`).join("|"));
+  let lastSubKey = "";
+  $effect(() => {
+    const key = subJobKey;
+    if (key === lastSubKey) return;
+    const prev = new Set(lastSubKey.split("|"));
+    lastSubKey = key;
+    const changed = new Set(key.split("|").filter((k) => k && !prev.has(k)).map((k) => k.split(":")[0]));
+    for (const sid of changed) void loadDoc(sid, true);
+    // once a job has ended, fetch again a moment later, in case its last write raced a fetch
+    const ended = key.split("|").filter((k) => k && !prev.has(k) && /:(done|failed|cancelled):/.test(k)).map((k) => k.split(":")[0]);
+    for (const sid of new Set(ended)) setTimeout(() => void loadDoc(sid, true), 1500);
+    if (key.includes(":done:")) void loadSetup();
+  });
+  const subTrack = $derived<Track>(subtitles.track);
+  const subItems = $derived(project && subTrack !== "off" ? timelineCues(project.tracks.video, subtitles.docs, subTrack) : []);
+  const laneItems = $derived(project ? timelineCues(project.tracks.video, subtitles.docs, subTrack === "off" ? "mixed" : subTrack) : []);
+  const shownSub = $derived(cueAt(subItems, time));
+  const subStatus = (c: Clip) => clipStatus(c, subtitles.docs[c.source]);
+  const withoutSubs = $derived(project ? project.tracks.video.filter((c) => !c.audio?.mute && !subStatus(c).covered).length : 0);
+  const subJobFor = (c: Clip) => store.jobs.find((j) => j.type.startsWith("subtitles") && j.type !== "subtitles_setup"
+    && (j.state === "queued" || j.state === "running") && j.meta?.source_id === c.source
+    && (j.meta?.start_sec == null || (j.meta.start_sec < c.out_sec && j.meta.start_sec + (j.meta.duration_sec ?? 1e9) > c.in_sec)));
+  async function needSetup(what: "transcribe" | "translate") {
+    const st = subtitles.setup ?? (await loadSetup());
+    if (st && !st.ready[what]) {
+      showSubSetup = true;
+      return true;
+    }
+    return false;
+  }
+  function stretchOf(c: Clip): SubStretch {
+    const o = c.audio?.output ? findOutput(c.audio.output)?.output ?? null : null;
+    return { source: c.source, sourceName: sourceName(c.source), start: c.in_sec, end: c.out_sec, cleaned: o, clips: [c.id] };
+  }
+  async function deleteSubtitles(c: Clip) {
+    const st = subStatus(c);
+    const i = project ? project.tracks.video.indexOf(c) + 1 : 0;
+    if (!confirm(`Delete the subtitles of clip ${i} (${st.cues} line${st.cues === 1 ? "" : "s"}, with their English and Hebrew versions)?\n\n` +
+        "Only the subtitles go: the clip stays on the timeline. You can generate them again.")) return;
+    if (await editSubs(c.source, [{ op: "delete_range", start: c.in_sec, end: c.out_sec }], "deleting subtitles"))
+      toast(`Deleted the subtitles of clip ${i}. Undo is in the Subtitles tab.`);
+  }
+  async function generateFor(c: Clip, again: boolean) {
+    if (await needSetup("transcribe")) return;
+    generating = { stretches: [stretchOf(c)], again };
+  }
+  async function generateMissing() {
+    showSubMenu = false;
+    if (!project || (await needSetup("transcribe"))) return;
+    const todo = project.tracks.video.filter((c) => !c.audio?.mute && !subStatus(c).covered);
+    if (!todo.length) return toast("Every clip already has subtitles");
+    const st = cleanStretches(todo, (sid) => sourceById(sid)?.probe?.duration_sec ?? Infinity);
+    generating = {
+      again: false,
+      stretches: st.map((x) => ({ source: x.source, sourceName: sourceName(x.source), start: x.start, end: x.end, clips: x.clips })),
+    };
+  }
+  async function translateClips(cs: Clip[], to: "en" | "he", mode: "missing" | "stale" | "all") {
+    showSubMenu = false;
+    if (await needSetup("translate")) return;
+    const st = cleanStretches(cs, (sid) => sourceById(sid)?.probe?.duration_sec ?? Infinity, 0);
+    try {
+      for (const x of st) {
+        await api.submit({ type: "subtitles_translate", source_id: x.source, to, mode, start_sec: x.start, duration_sec: x.end - x.start });
+      }
+      toast(`Translating into ${to === "en" ? "English" : "Hebrew"}. Lines appear in the Subtitles tab as they are done.`);
+    } catch (e) {
+      reportError(e);
+    }
+  }
+  const TRACKS: [Track, string][] = [["off", "Off"], ["mixed", "Mixed"], ["en", "English"], ["he", "Hebrew"]];
+  const TRACK_TIPS: Record<Track, string> = {
+    off: "No subtitles in the preview",
+    mixed: "What is said, in the language it is said in (Hebrew and English mixed)",
+    en: "English only: Hebrew lines show their English translation",
+    he: "Hebrew only: English lines show their Hebrew translation",
+  };
+
   // The clip under the playhead, for the Resulting video's "Clip N · time in clip" readout.
   const placedClips = $derived(project ? place(project.tracks.video) : []);
   const playingClip = $derived(clipAt(placedClips, Math.min(time, Math.max(0, total - 1e-3))));
@@ -615,8 +725,19 @@
   }
 
   function removeSelected() {
-    if (!selected) return;
+    if (!selected || !project) return;
     const sel = selected;
+    // ask first: a click or ⌫ in the wrong place must not lose work
+    if (sel.kind === "clip") {
+      const i = project.tracks.video.findIndex((c) => c.id === sel.id);
+      const c = project.tracks.video[i];
+      if (!c) return;
+      if (!confirm(`Delete clip ${i + 1} (${sourceName(c.source)}, ${formatClock(c.in_sec, false)}–${formatClock(c.out_sec, false)}) from the timeline?\n\n` +
+          "The video itself, its cleaned versions and its subtitles stay. Undo (⌘Z) brings the clip back while this page is open.")) return;
+    } else {
+      const m = project.tracks.music.find((x) => x.id === sel.id);
+      if (!m || !confirm(`Remove the music "${m.name ?? m.file.split("/").pop()}" from the timeline?\n\nUndo (⌘Z) brings it back while this page is open.`)) return;
+    }
     commit((p) => {
       if (sel.kind === "clip") {
         p.tracks.video = p.tracks.video.filter((c) => c.id !== sel.id);
@@ -794,6 +915,23 @@
       <button disabled={!cleanState.waiting.length} onclick={cleanClips}
               title="Clean the sound of every clip still on its original sound, with the same settings; each clip switches to its cleaned sound when it is ready. Select a clip to clean it with its own settings.">
         Clean clips{cleanState.waiting.length ? ` (${cleanState.waiting.length})` : ""}…</button>
+      <span class="menu-anchor">
+        <button onclick={() => (showSubMenu = !showSubMenu)} title="Subtitles for the whole project">Subtitles…</button>
+        {#if showSubMenu}
+          <div class="menu-backdrop" role="presentation" onpointerdown={() => (showSubMenu = false)}></div>
+          <div class="sub-menu card col" role="menu">
+            <button class="item" role="menuitem" disabled={!withoutSubs} onclick={generateMissing}>Generate for clips without subtitles{withoutSubs ? ` (${withoutSubs})` : ""}…</button>
+            <button class="item" role="menuitem" onclick={() => translateClips(project!.tracks.video, "en", "missing")}>Create English only for all</button>
+            <button class="item" role="menuitem" onclick={() => translateClips(project!.tracks.video, "he", "missing")}>Create Hebrew only for all</button>
+            <button class="item" role="menuitem" onclick={() => translateClips(project!.tracks.video, "en", "stale")}>Update out-of-date English</button>
+            <button class="item" role="menuitem" onclick={() => translateClips(project!.tracks.video, "he", "stale")}>Update out-of-date Hebrew</button>
+            <div class="sep"></div>
+            <button class="item" role="menuitem" onclick={() => { showSubMenu = false; showNames = true; }}>Names…</button>
+            <button class="item" role="menuitem" onclick={() => { showSubMenu = false; showSubSetup = true; }}>Set up…</button>
+            <button class="item" role="menuitem" onclick={() => { showSubMenu = false; lowerTab = "subtitles"; }}>Edit subtitles</button>
+          </div>
+        {/if}
+      </span>
       <button onclick={() => (showStorage = true)} title="Disk used by this project's videos: originals, editing copies, tuning audio, rendered versions">Storage…</button>
       <button onclick={chooseMusic}>♪ Add music…</button>
       <button class="primary" disabled={!project.tracks.video.length} onclick={openExport}>Export…</button>
@@ -911,12 +1049,26 @@
             <span class="faint">·</span>
           {/if}
           <span class="mono small" title="Time in the whole resulting video">{formatClock(time)} / {formatClock(total)}</span></div>
+        <div class="row track-row">
+          <span class="small dim">Subtitles shown</span>
+          <span class="row seg" role="group" aria-label="Subtitles shown in the video">
+            {#each TRACKS as [t, label] (t)}
+              <button class:on={subTrack === t} aria-pressed={subTrack === t} title={TRACK_TIPS[t]} onclick={() => setTrack(t)}>{label}</button>
+            {/each}
+          </span>
+        </div>
         <div class="stage"><div class="screen program" style:--ar={outShape}>
           <!-- svelte-ignore a11y_media_has_caption -->
           <video bind:this={videoA} preload="auto"></video>
           <!-- svelte-ignore a11y_media_has_caption -->
           <video bind:this={videoB} preload="auto"></video>
           {#if !project.tracks.video.length}<div class="overlay dim">Nothing on the timeline yet: drag along a video's strip below, then press ＋ Add to end.</div>{/if}
+          {#if shownSub}
+            <div class="subs" class:missing={shownSub.missing}>
+              {#each shownSub.text.split("\n") as line, k (k)}<div dir="auto">{line}</div>{/each}
+              {#if shownSub.missing}<span class="sub-tag">not translated</span>{:else if shownSub.stale}<span class="sub-tag">out of date</span>{/if}
+            </div>
+          {/if}
         </div></div>
         <div class="row">
           <button class="small" onclick={() => program?.seek(0)} title="Home">⏮</button>
@@ -964,7 +1116,9 @@
     <div class="timeline-wrap" onpointerdowncapture={() => (active = "program")}>
     <Timeline clips={project.tracks.video} music={project.tracks.music} {time} bind:pps bind:viewWidth={timelineWidth} memory="edit.timelineScroll.{name}" {selected} {thumbs}
               {sourceLength} {sourceName} onseek={(t) => program?.seek(t)} onselect={(s) => (selected = s)}
-              onchange={onTimelineChange} onsound={openSoundMenu} />
+              onchange={onTimelineChange} onsound={openSoundMenu}
+              subtitles={laneItems} ccOf={(c) => subStatus(c)}
+              onsubtitle={(t) => { program?.seek(t); lowerTab = "subtitles"; selected = null; }} />
     </div>
 
     <!-- the selected clip (or music, or the project's settings): right under the timeline -->
@@ -1037,6 +1191,36 @@
             {covering.length ? "Clean again…" : "Clean this clip…"}</button>
           <button class="small danger" onclick={removeSelected}>Delete</button>
         </div>
+        {@const st = subStatus(c)}
+        {@const job = subJobFor(c)}
+        <div class="row wrap subs-row">
+          <span class="dim small">Subtitles</span>
+          <span class="small">{#if job}<span class="faint">{job.state === "running" ? (job.step?.title ?? "working") + "…" : "waiting…"}</span>
+            {:else if !st.cues && !st.covered}<span class="faint">none yet</span>
+            {:else if !st.cues}<span class="faint">no speech found</span>
+            {:else}{st.cues} line{st.cues > 1 ? "s" : ""}{st.flagged ? ` · ${st.flagged} to check` : ""}
+              {#each [["en", "English"], ["he", "Hebrew"]] as const as [l, name] (l)}
+                {@const s = st[l]}
+                · {name} {s.of === 0 || (s.done === s.of && !s.stale) ? "✓" : s.done === 0 ? "–" : `${s.done}/${s.of}`}{s.stale ? ` (${s.stale} out of date)` : ""}
+              {/each}
+            {/if}</span>
+          {#if !st.covered}
+            <button class="small" disabled={!!job || !sourceById(c.source)?.exists} onclick={() => generateFor(c, false)}>Generate subtitles…</button>
+          {/if}
+          {#if st.cues}
+            {#each [["en", "English"], ["he", "Hebrew"]] as const as [l, name] (l)}
+              {@const s = st[l]}
+              {#if s.stale}
+                <button class="small" disabled={!!job} onclick={() => translateClips([c], l, "stale")}>Update {name} ({s.stale})</button>
+              {:else if s.done < s.of}
+                <button class="small" disabled={!!job} onclick={() => translateClips([c], l, "missing")}>Create {name} only</button>
+              {/if}
+            {/each}
+            <button class="link small" onclick={() => (lowerTab = "subtitles")}>Edit…</button>
+            <button class="link small" disabled={!!job} onclick={() => generateFor(c, true)} title="Transcribe this clip again, e.g. with another model">Generate again…</button>
+            <button class="link small danger" disabled={!!job} onclick={() => deleteSubtitles(c)} title="Delete this clip's subtitle lines and their translations (the clip stays)">Delete subtitles…</button>
+          {/if}
+        </div>
       {:else if selMusic}
         {@const m = selMusic}
         <div class="row wrap">
@@ -1073,6 +1257,16 @@
       {/if}
     </div>
 
+    <div class="row lower-tabs">
+      <button class:on={lowerTab === "videos"} onclick={() => (lowerTab = "videos")}>Videos</button>
+      <button class:on={lowerTab === "subtitles"} onclick={() => (lowerTab = "subtitles")}>Subtitles</button>
+    </div>
+    {#if lowerTab === "subtitles"}
+      <div class="card">
+        <SubtitlesPanel clips={project.tracks.video} {time} selected={selClip?.id ?? null} {sourceName}
+                        onseek={(t) => program?.seek(t)} onplay={playRange} />
+      </div>
+    {:else}
     <!-- the videos to pick clips from, under the timeline they feed -->
     <VideoStrips {videos} current={srcId} time={srcTime}
                  marks={markIn !== null ? { start: markIn, end: markOut ?? markIn } : null} used={usedVideos}
@@ -1081,6 +1275,7 @@
                  {hearing} onpiece={pickVersion}
                  onadd={() => (addingVideos = true)} onremove={removeVideo} onreorder={reorderVideos}
                  onversion={(old, now) => (now ? followRename(old, now) : dropVersion(old))} />
+    {/if}
     {#if addingVideos}
       <AddVideos available={sources.filter((s) => !project?.sources[s.id])} onadd={addVideos} onclose={() => (addingVideos = false)} />
     {/if}
@@ -1148,6 +1343,23 @@
     }} />
   </Modal>
 {/if}
+{#if generating}
+  <Modal title={generating.again ? "Generate subtitles again" : "Generate subtitles"} width="min(640px, 94vw)" onclose={() => (generating = null)}>
+    <GenerateSubtitles stretches={generating.stretches} docs={subtitles.docs} again={generating.again}
+                       onqueued={() => (generating = null)} onclose={() => (generating = null)} />
+  </Modal>
+{/if}
+{#if showSubSetup}
+  <Modal title="Set up subtitles" width="min(720px, 94vw)" onclose={() => (showSubSetup = false)}>
+    <SubtitlesSetup onclose={() => (showSubSetup = false)} />
+  </Modal>
+{/if}
+{#if showNames}
+  <Modal title="Names" width="min(560px, 94vw)" onclose={() => (showNames = false)}>
+    <NamesDialog onclose={() => (showNames = false)} />
+  </Modal>
+{/if}
+
 {#if showStorage && project}
   <Modal title="Storage · {project.name}" onclose={() => (showStorage = false)}>
     <StorageView project={project.name} />
@@ -1177,6 +1389,27 @@
   .viewers { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .viewer { gap: 6px; padding: 10px 12px; min-height: 0; overflow: hidden; }
   .tzoom { gap: 4px; align-items: center; }
+  .menu-anchor { position: relative; }
+  .sub-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 41; width: 300px; gap: 2px; padding: 6px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); }
+  .sub-menu .item { display: block; text-align: left; background: none; border: none; padding: 5px 6px; border-radius: 4px; cursor: pointer; color: var(--text); font-size: 13px; }
+  .sub-menu .item:hover:not(:disabled) { background: var(--bg-hover); }
+  .sub-menu .item:disabled { color: var(--text-faint); cursor: default; }
+  .track-row { gap: 8px; align-items: center; }
+  .seg button { border-radius: 0; padding: 3px 12px; font-size: 12.5px; }
+  .seg button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .seg button:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+  .seg button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .subs {
+    position: absolute; left: 6%; right: 6%; bottom: 5%; z-index: 3; text-align: center; pointer-events: none;
+    display: flex; flex-direction: column; align-items: center; gap: 0.1em; font-size: max(13px, 4.6cqh); line-height: 1.25;
+  }
+  .subs > div { background: rgb(0 0 0 / 0.62); color: #fff; padding: 0.05em 0.4em; border-radius: 3px; unicode-bidi: plaintext; text-wrap: balance; }
+  .subs.missing > div { font-style: italic; color: #ddd; }
+  .sub-tag { font-size: 0.5em; color: var(--warn); background: rgb(0 0 0 / 0.6); padding: 0 0.4em; border-radius: 3px; }
+  .subs-row { gap: 8px; align-items: center; margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+  .lower-tabs { gap: 2px; margin-bottom: -4px; }
+  .lower-tabs button { border-radius: var(--radius) var(--radius) 0 0; padding: 4px 14px; font-size: 13px; background: var(--bg-sunken); border-bottom: none; }
+  .lower-tabs button.on { background: var(--bg-raised); color: var(--text); font-weight: 600; }
   .clip-time { display: inline-flex; gap: 6px; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .tzoom .mono { min-width: 40px; text-align: center; font-size: 11px; }
   .icon-btn { width: 22px; height: 20px; padding: 0; line-height: 1; font-size: 13px; }

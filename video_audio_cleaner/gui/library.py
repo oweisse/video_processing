@@ -175,12 +175,25 @@ def scan(output_dir, extra_sources=()):
         s["source_kind"] = kinds[-1] if kinds else None
         s["probe"] = cached_probe(output_dir, s)
         s["prep"] = prep_state(output_dir, s["id"])
+        s["subtitles"] = subtitles_state(output_dir, s["id"])
     ordered = sorted(sources.values(), key=lambda s: s["name"].lower())
     from . import projects
     return {"output_dir": str(output_dir), "sources": ordered,
             "unknown": sorted(unknown, key=lambda o: o["file"]),
             "exports": sorted(exports, key=lambda o: o["created"] or "", reverse=True),
             "projects": projects.list_projects(output_dir)}
+
+
+def subtitles_state(output_dir, source_id):
+    """A small summary of a source's subtitles (docs/subtitles-plan.md §6.2), or None."""
+    from .. import subs
+    path = subs.doc_path(output_dir, source_id)
+    if not path.is_file():
+        return None
+    try:
+        return subs.summary(subs.load(path))
+    except (OSError, ValueError):
+        return None
 
 
 def prep_cache(output_dir):

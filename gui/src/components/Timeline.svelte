@@ -4,6 +4,7 @@
   // while dragging and committed on release.
   import { place, zoomGlide, type Clip, type MusicClip } from "../lib/edit";
   import { loadPref, savePref } from "../lib/prefs";
+  import type { TimelineCue } from "../lib/subtitles";
   import { findOutput } from "../lib/state.svelte";
   import { versionName, versionSettings } from "../media/pieces";
   import { formatClock } from "../lib/time";
@@ -26,6 +27,9 @@
     onselect,
     onchange,
     onsound,
+    subtitles = [],
+    ccOf,
+    onsubtitle,
   }: {
     clips: Clip[];
     music: MusicClip[];
@@ -42,6 +46,11 @@
     onchange: (clips: Clip[], music: MusicClip[]) => void;
     /** The sound badge of a clip was clicked: choose its version there. */
     onsound?: (clipId: string, anchor: DOMRect) => void;
+    /** Subtitle lines on the timeline's clock (docs/subtitles-plan.md §7.3). */
+    subtitles?: TimelineCue[];
+    /** A clip's subtitles, for its CC chip. */
+    ccOf?: (c: Clip) => { cues: number; covered: boolean; flagged: number; en: { done: number; of: number; stale: number }; he: { done: number; of: number; stale: number } };
+    onsubtitle?: (t: number) => void;
   } = $props();
 
   const outOf = (c: Clip) => (c.audio?.output ? findOutput(c.audio.output)?.output ?? null : null);
@@ -254,6 +263,17 @@
                   onclick={(e) => { e.stopPropagation(); onselect({ kind: "clip", id: c.id }); onsound?.(c.id, (e.currentTarget as HTMLElement).getBoundingClientRect()); }}>
             {#if c.audio?.mute}🔇 muted{:else if !c.audio?.file}⚠ original sound{:else}🔊 {outOf(c) ? versionName(outOf(c)!) : (c.audio.output ?? "cleaned")}{#if outOf(c) && versionSettings(outOf(c)!)}<span class="dim"> · {versionSettings(outOf(c)!)}</span>{/if}{/if} ▾
           </button>
+          {#if ccOf && p.length * pps > 90}
+            {@const cc = ccOf(c)}
+            {@const done = (l: "en" | "he") => cc[l].of > 0 && cc[l].done === cc[l].of && !cc[l].stale}
+            <span class="cc" class:none={!cc.cues} class:warn={!!cc.flagged || cc.en.stale > 0 || cc.he.stale > 0}
+                  style:left="{4 + stick(p.start, p.length)}px"
+                  title={!cc.cues ? (cc.covered ? "Subtitles: no speech found" : "No subtitles yet") :
+                    `Subtitles: ${cc.cues} lines` + (cc.flagged ? `, ${cc.flagged} to check` : "") +
+                    ` · English ${cc.en.done}/${cc.en.of}` + (cc.en.stale ? ` (${cc.en.stale} out of date)` : "") +
+                    ` · Hebrew ${cc.he.done}/${cc.he.of}` + (cc.he.stale ? ` (${cc.he.stale} out of date)` : "")}>
+              CC{cc.cues ? "" : " –"}{done("en") ? "+EN" : ""}{done("he") ? "+HE" : ""}</span>
+          {/if}
           <div class="label" style:left="{6 + stick(p.start, p.length)}px">{sourceName(c.source)} · {formatClock(c.in_sec, false)}</div>
           <div class="handle left" onpointerdown={(e) => startClip(e, c, "in")} role="presentation"></div>
           <div class="handle right" onpointerdown={(e) => startClip(e, c, "out")} role="presentation"></div>
@@ -289,6 +309,18 @@
       {/each}
     </div>
 
+    {#if subtitles.length || ccOf}
+      <div class="track subs-lane" role="presentation" onpointerdown={startSeek}>
+        {#each subtitles as it (it.cue + it.clip)}
+          <button class="sub" class:missing={it.missing} class:stale={it.stale}
+                  style="left:{it.start * pps}px;width:{Math.max(2, (it.end - it.start) * pps)}px"
+                  title={it.text} dir="auto"
+                  onpointerdown={(e) => e.stopPropagation()}
+                  onclick={() => onsubtitle?.(it.start + 0.01)}>{(it.end - it.start) * pps > 24 ? it.text : ""}</button>
+        {/each}
+      </div>
+    {/if}
+
     <div class="playhead" style="left:{time * pps}px"></div>
   </div>
 </div>
@@ -298,13 +330,28 @@
     overflow-x: auto; overflow-y: hidden; background: var(--bg-sunken);
     border: 1px solid var(--border); border-radius: var(--radius); user-select: none;
   }
-  .content { position: relative; height: 162px; }
+  .content { position: relative; min-height: 162px; }
   .ruler { position: relative; height: 22px; border-bottom: 1px solid var(--border); cursor: text; overflow: hidden; }
   .tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--border); }
   .tick span { position: absolute; left: 3px; top: 3px; font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
   .track { position: relative; border-bottom: 1px solid var(--border); }
   .track.video { height: 86px; }
   .track.music { height: 52px; }
+  .track.subs-lane { height: 24px; }
+  .sub {
+    position: absolute; top: 3px; bottom: 3px; padding: 0 4px; border-radius: 3px; border: 1px solid transparent;
+    background: color-mix(in srgb, var(--text) 16%, var(--bg-raised)); color: var(--text); font-size: 10.5px;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: start; cursor: pointer; unicode-bidi: plaintext;
+  }
+  .sub:hover { background: color-mix(in srgb, var(--accent) 35%, var(--bg-raised)); }
+  .sub.missing { font-style: italic; opacity: 0.6; }
+  .sub.stale { border-color: var(--warn); }
+  .cc {
+    position: absolute; top: 24px; z-index: 2; font-size: 9.5px; line-height: 13px; padding: 0 4px; border-radius: 3px;
+    background: color-mix(in srgb, var(--b-color) 80%, black); color: #000; pointer-events: auto; cursor: default; font-weight: 600;
+  }
+  .cc.none { background: var(--bg-header); color: var(--text-faint); font-weight: 400; }
+  .cc.warn { background: var(--warn); }
   .clip, .mclip {
     position: absolute; top: 5px; bottom: 5px; border-radius: 5px; overflow: hidden; cursor: grab;
     border: 1px solid var(--b-color); background: color-mix(in srgb, var(--b-color) 18%, var(--bg-raised));

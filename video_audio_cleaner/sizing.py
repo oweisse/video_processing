@@ -785,6 +785,7 @@ def run(project_path, project, s, out, force_encode=False):
             p = {**p, "canvas": cv}
             more, passes = _encode(project, s, est, partial, measured, cv, work, steps)
             commands = (commands if verified is False else []) + more
+        subtitle_info = E.add_subtitles(partial, project, project_path, s, work)
         os.replace(partial, out)
         procs.unregister_path(str(partial))
     finally:
@@ -802,5 +803,7 @@ def run(project_path, project, s, out, force_encode=False):
                   passes=passes, over_budget=over > OVER_BUDGET_WARN,
                   codec="copy" if est["mode"] == "copy" else s.get("codec") or "h264",
                   estimate=est)
+    if subtitle_info:
+        result["subtitles"] = E.subtitle_result(subtitle_info, E.write_subtitle_files(out, subtitle_info))
     E.finish(out, project_path, project, commands, result)
     return out, result

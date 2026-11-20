@@ -406,3 +406,38 @@ def test_zoom_glide_moves_the_framing_smoothly(fx, fx_probe, tmp_path):
     d = lambda a, b: float(np.abs(a - b).mean())
     assert d(mid_f, wide_f) > 2 and d(mid_f, close_f) > 2          # neither end: moving
     assert d(close_f, frame_at(2.9)) < d(close_f, wide_f)           # after the glide: settled
+
+
+def test_subtitles_as_srt_files_and_tracks(fx, fx_probe, tmp_path):
+    from video_audio_cleaner import subs
+    doc = subs.doc_path(tmp_path, "fx")
+    def seed(d):
+        d["cues"] = [subs.make_cue(1.0, 2.5, "שלום everyone"), subs.make_cue(5.0, 6.5, "second line")]
+        d["cues"][0]["tr"] = {"en": {"text": "Hello everyone", "src": subs.text_hash("שלום everyone")}}
+        d["coverage"] = [[0, 10]]
+    subs.update(doc, seed)
+    # the second line's clip first, then the first line's
+    proj = project(fx, fx_probe, [{"in_sec": 4, "out_sec": 7, "audio": None},
+                                  {"in_sec": 0, "out_sec": 3, "audio": None}],
+                   export={"subtitles": {"srt": ["mixed", "en"], "tracks": ["mixed", "en", "he"], "default_track": "en"}})
+    out = tmp_path / "subbed.mp4"
+    _, result = E.run(write(tmp_path, proj), out)
+    mixed = (tmp_path / "subbed.mixed.srt").read_text(encoding="utf-8")
+    assert "00:00:01,000 --> 00:00:02,500\nsecond line" in mixed
+    assert "00:00:04,000 --> 00:00:05,500\nשלום everyone" in mixed
+    en = (tmp_path / "subbed.en.srt").read_text(encoding="utf-8")
+    assert "Hello everyone" in en and "second line" in en          # English lines need no translation
+    assert not (tmp_path / "subbed.he.srt").exists()                # asked as a track only
+    streams = ffprobe(out, "stream=codec_type,codec_name:stream_tags=language,title:stream_disposition=default")["streams"]
+    subs_streams = [s for s in streams if s["codec_type"] == "subtitle"]
+    assert [(s["codec_name"], s["tags"]["language"]) for s in subs_streams] == \
+        [("mov_text", "mul"), ("mov_text", "eng"), ("mov_text", "heb")]
+    assert [s["disposition"]["default"] for s in subs_streams] == [0, 1, 0]
+    rep = result["subtitles"]["completeness"]
+    assert rep["he"]["missing"] == 2 and rep["mixed"]["cues"] == 2      # neither line has Hebrew yet
+    # without subtitles in the settings, nothing changes
+    out2 = tmp_path / "plain.mp4"
+    proj2 = project(fx, fx_probe, [{"in_sec": 4, "out_sec": 7, "audio": None}])
+    E.run(write(tmp_path, proj2), out2)
+    assert not [s for s in ffprobe(out2, "stream=codec_type")["streams"] if s["codec_type"] == "subtitle"]
+    assert not list(tmp_path.glob("plain.*.srt"))

@@ -4,6 +4,31 @@
 
 **Added**
 
+- Edit: deleting a clip or music asks first (with the clip's number, video and times).
+  **Delete subtitles…** in the clip panel removes just that clip's subtitle lines and
+  their translations (the clip stays); Undo in the Subtitles tab puts deleted lines back
+  exactly, translations included (`delete_range`, `put`, `cover` edits). Clicking a
+  subtitle on the timeline lane deselects the clip, so ⌫ cannot delete the clip by
+  mistake. The Subtitles tab follows playback inside its own scroll area; the page no
+  longer jumps down to it. New subtitles and translations appear as soon as the job ends,
+  without reloading the page (an older answer from the server can no longer replace a newer one).
+  The subtitle switch above the Resulting video ("Subtitles shown: Off · Mixed · English ·
+  Hebrew") is larger and explains each choice; "Spoken (mixed)" is called Mixed everywhere.
+- Subtitles, made locally (docs/subtitles-plan.md): `clean-audio-subtitles` (`setup`,
+  `transcribe`, `translate`), new modules `subs.py` (the per-video document, cue editing,
+  SRT, timeline mapping), `transcribe.py` (Silero VAD → the language checked every 1.5 s and
+  speech split where it changes → whisper.cpp per language, so a short Hebrew sentence
+  inside English stays Hebrew; a Hebrew/English retry where it looks wrong) and
+  `translate.py` (our own `ollama serve` per job; passages with context, numbered lines,
+  checked replies, only due lines stored). Job types `subtitles`, `subtitles_translate`,
+  `subtitles_setup`; endpoints under `/api/subtitles/…` and
+  `/api/projects/{name}/subtitles[.srt]`. Edit: **Generate subtitles…**, **Create English
+  only / Hebrew only**, **Update** for out-of-date lines, a **Subtitles…** menu for all
+  clips and names, a Spoken/English/Hebrew/Off switch with subtitles drawn over the
+  Resulting video, a subtitle lane on the timeline, CC chips on clips, and a
+  **Subtitles** tab to correct text, timing and translations (split, merge, add, delete,
+  undo). Export and Deliver: `.srt` files and/or selectable `mov_text` tracks
+  (`--subtitles_srt`, `--subtitle_tracks`). Storage counts subtitles per video.
 - GUI: **Deliver is where exports start.** Pick a project, then *Keep the original
   quality* or *Fit a size* (GB per hour or in total, HEVC or H.264, a smaller picture
   height, the hardware encoder). *Estimate* tries short samples and shows the predicted

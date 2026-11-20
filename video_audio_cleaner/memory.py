@@ -140,6 +140,12 @@ EXPORT_GB = 3.0         # ffmpeg decoding several 4K originals and encoding
 PICTURE_GB = 0.6        # one frame of a 4K original
 
 
+# Subtitles (measured on an M5 Pro, docs/subtitles-plan.md §0.5): whisper.cpp large-v3 on
+# the GPU, and the translation model held by our own Ollama (gemma3:27b: 20.6 GB peak).
+SUBTITLES_GB = 5.0
+TRANSLATE_GB = 22.0
+
+
 def clean_estimate_gb(seconds):
     return CLEAN_BASE_GB + CLEAN_PER_MIN_GB * max(0.0, float(seconds or 0.0)) / 60.0
 

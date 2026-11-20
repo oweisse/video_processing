@@ -122,6 +122,36 @@ can be deleted per window from the Candidates view.
 How it is built, and what comes next (cutting, stitching, soundtrack, export), is in
 [docs/gui-design.md](docs/gui-design.md).
 
+## Subtitles: `clean-audio-subtitles`
+
+Hebrew, English and mixed speech, made and translated **on this Mac** (nothing is sent
+anywhere). Plan and design: `docs/subtitles-plan.md`.
+
+- **Mixed**: what was said, in whatever language: whisper.cpp with Whisper
+  large-v3 (or the ivrit.ai Hebrew-tuned model), the language detected per stretch of
+  speech.
+- **English only / Hebrew only**: the corrected spoken lines translated by a local model
+  (gemma3:27b through our own private Ollama server, started and stopped per job).
+
+In the GUI (Edit): select a clip → **Generate subtitles…** under the timeline; correct the
+lines in the **Subtitles** tab; then **Create English only** / **Create Hebrew only**.
+Editing a spoken line afterwards marks its translation *out of date*; **Update**
+retranslates just those, and translations you corrected by hand are kept. Subtitles belong
+to the videos (`_subtitles/<video id>/subtitles.json`), so cutting and moving clips never
+loses them. Export writes `.srt` files and/or selectable tracks in the MP4 (Deliver →
+Subtitles).
+
+One-time setup (about 20 GB): `brew install whisper-cpp ollama`,
+`./venv/bin/pip install -e ".[subtitles]"`, then `clean-audio-subtitles setup --download
+whisper` and `--download translate` (and optionally `--download ivrit`).
+`clean-audio-subtitles setup` lists what is missing.
+
+```bash
+clean-audio-subtitles transcribe VIDEO.mp4 --output_dir LIB --id SOURCE_ID --start 60 --end 120
+clean-audio-subtitles translate --output_dir LIB --id SOURCE_ID --to en
+clean-audio-export LIB/_projects/NAME/project.json --subtitles_srt mixed,en,he --subtitle_tracks en,he
+```
+
 ## Pipeline
 
 Order matters. Audio is extracted **completely unprocessed**, cleaned, and only then

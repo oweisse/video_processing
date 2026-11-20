@@ -63,7 +63,9 @@ def source_usage(output_dir, source):
         original = os.stat(source["path"]).st_size
     except OSError:
         original = (source.get("probe") or {}).get("size") or 0
-    return {"original": original, "editing": editing, "tuning": tuning, "rendered": rendered}
+    subtitles = du(output_dir / "_subtitles" / sid)
+    return {"original": original, "editing": editing, "tuning": tuning, "rendered": rendered,
+            "subtitles": subtitles}
 
 
 def usage(output_dir, library, project_name=None):
@@ -87,8 +89,8 @@ def usage(output_dir, library, project_name=None):
         rows.append({"id": s["id"], "name": s["name"], "exists": s.get("exists", True),
                      "versions": sum(1 for o in s.get("outputs") or [] if o.get("exists")),
                      "tunings": sum(len(p.get("windows") or []) for p in s.get("plans") or []), **u,
-                     "extra": u["editing"] + u["tuning"] + u["rendered"]})
-    totals = {k: sum(r[k] for r in rows) for k in ("original", "editing", "tuning", "rendered", "extra")}
+                     "extra": u["editing"] + u["tuning"] + u["rendered"] + u["subtitles"]})
+    totals = {k: sum(r[k] for r in rows) for k in ("original", "editing", "tuning", "rendered", "subtitles", "extra")}
     totals["project_files"] = project_files
     totals["exported"] = exported
     return {"project": project_name, "videos": rows, "totals": totals,
