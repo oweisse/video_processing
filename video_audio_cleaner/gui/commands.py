@@ -59,9 +59,14 @@ def overrides_argv(overrides, autotune):
     return out
 
 
+# Background music stays unless the user asks to remove it: the voices are separated from
+# it (Demucs), cleaned on their own, and the music goes back in at its original level.
+KEEP_MUSIC_LEVEL_DB = 0.0
+
+
 def clean_argv(source_path, output_dir, start_sec=None, duration_sec=None, autotune=True,
                source_kind=None, separate_music=False, tag=None, output=None,
-               normalize=True, overrides=None):
+               normalize=True, overrides=None, music_level_db=None):
     args = [str(source_path), "--output_dir", str(output_dir), "--progress", "json"]
     if normalize and "--normalize" not in (overrides or {}):
         args.append("--normalize")
@@ -75,6 +80,8 @@ def clean_argv(source_path, output_dir, start_sec=None, duration_sec=None, autot
         args += ["--autotune", "--source", source_kind, "--keep_candidates"]
     if separate_music:
         args.append("--separate_music")
+        if music_level_db is not None and "--music_level_db" not in (overrides or {}):
+            args.append(f"--music_level_db={music_level_db:g}")
     if tag:
         args += ["--tag", tag]
     if output:
@@ -93,7 +100,7 @@ def candidate_argv(source_path, output_dir, plan_path, window, index, tag=None):
     return [PYTHON, "-m", "video_audio_cleaner.cli", *args]
 
 
-def tune_argv(source_path, output_dir, windows, source_kind, separate_music=False):
+def tune_argv(source_path, output_dir, windows, source_kind, separate_music=False, music_levels=None):
     if source_kind not in ("tape", "digital"):
         raise ValueError("Tuning needs the source kind: tape or digital")
     if not windows:
@@ -104,6 +111,8 @@ def tune_argv(source_path, output_dir, windows, source_kind, separate_music=Fals
             "--keep_candidates", "--progress", "json"]
     if separate_music:
         args.append("--separate_music")
+        if music_levels is not None:
+            args.append(f"--music_levels={music_levels}")
     _check(tune.build_parser(), args)
     return [PYTHON, "-m", "video_audio_cleaner.tune", *args]
 
@@ -113,10 +122,14 @@ def prep_argv(source_path, cache_dir, source_id, kinds=("proxy", "thumbs", "peak
             "--cache", str(cache_dir), "--id", source_id, "--progress", "json"]
 
 
-def export_argv(project_path, reencode=False):
+def export_argv(project_path, reencode=False, estimate=False):
+    """The budget, codec and the rest travel in the project file, so the command stays
+    short and reproducible."""
     args = [str(project_path), "--progress", "json"]
     if reencode:
         args.append("--reencode")
+    if estimate:
+        args.append("--estimate")
     return [PYTHON, "-m", "video_audio_cleaner.export", *args]
 
 

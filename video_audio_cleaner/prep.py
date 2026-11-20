@@ -30,6 +30,11 @@ PEAKS_MAGIC = b"VACP"
 PEAKS_VERSION = 1
 
 
+# Stored pixels that are not square (16:15 in many tape transfers) are widened first, so
+# previews show the true shape: browsers ignore a JPEG's or a video's pixel aspect.
+SQUARE_PIXELS = "scale=trunc(iw*sar/2)*2:ih,setsar=1"
+
+
 def _partial(path):
     path = Path(path)
     return path.with_name(path.stem + ".partial" + path.suffix)
@@ -38,7 +43,7 @@ def _partial(path):
 def proxy(source, out, duration=None):
     tmp = _partial(out)
     procs.register_path(str(tmp))
-    vf = f"scale=-2:'min({PROXY_HEIGHT},ih)':flags=bicubic,format=yuv420p"
+    vf = f"{SQUARE_PIXELS},scale=-2:'min({PROXY_HEIGHT},ih)':flags=bicubic,format=yuv420p"
     ffmpeg_utils.run_ffmpeg(
         ["ffmpeg", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
          "-c:v", "h264_videotoolbox", "-b:v", "2500k", "-g", str(PROXY_GOP), "-bf", "0",
@@ -55,7 +60,7 @@ def thumbs(source, out_dir, duration=None):
     tmp.mkdir(parents=True, exist_ok=True)
     ffmpeg_utils.run_ffmpeg(
         ["ffmpeg", "-y", "-i", str(source), "-map", "0:v:0",
-         "-vf", f"fps=1/{THUMB_INTERVAL:g},scale=-2:{THUMB_HEIGHT}", "-q:v", "6",
+         "-vf", f"fps=1/{THUMB_INTERVAL:g},{SQUARE_PIXELS},scale=-2:{THUMB_HEIGHT}", "-q:v", "6",
          "-start_number", "0", str(tmp / "t%05d.jpg")],
         duration, "Thumbnails")
     if out_dir.exists():

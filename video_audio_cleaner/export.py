@@ -28,7 +28,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import events, ffmpeg_utils, procs
+from . import events, ffmpeg_utils, probe as probe_mod, procs
 from .console import print_error, print_info, print_step, print_success, print_warning
 
 SCHEMA = 1
@@ -67,9 +67,117 @@ def clips(project):
     return out
 
 
+TRANSITIONS = ("crossfade", "soft_cut")
+
+
 def transition(clip):
+    """Seconds this clip overlaps the previous one on the timeline (crossfades only; a
+    soft cut blends the sound around the cut without moving anything)."""
     tr = clip.get("transition_in") or {}
+    if tr and tr.get("type") not in TRANSITIONS:
+        raise ProjectError(f"clip {clip.get('id')} has an unknown transition {tr.get('type')!r}")
     return float(tr.get("sec") or 0.0) if tr.get("type") == "crossfade" else 0.0
+
+
+# ------------------------------------------------------------------ joins
+_durations = {}
+
+
+def file_duration(path):
+    """A media file's length in seconds (ffprobe, remembered per run), or None."""
+    if path not in _durations:
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                  "-of", "csv=p=0", str(path)],
+                                 capture_output=True, text=True, timeout=30).stdout
+            _durations[path] = float(out.strip())
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            _durations[path] = None
+    return _durations[path]
+
+
+def _sound(clip):
+    """What a clip is heard through: "mute", ("file", path) or ("source", id)."""
+    audio = clip.get("audio") or {}
+    if audio.get("mute"):
+        return "mute"
+    return ("file", audio["file"]) if audio.get("file") else ("source", clip["source"])
+
+
+def spare_sound(project, clip, durations=file_duration):
+    """(before the in point, after the out point): sound that exists beyond the clip's
+    edges and a soft cut may borrow."""
+    sound = _sound(clip)
+    if sound == "mute":
+        return 0.0, 0.0
+    if sound[0] == "file":
+        audio = clip["audio"]
+        start = float(audio.get("start_sec") or 0.0)
+        length = audio.get("duration_sec")
+        if length is None:
+            length = durations(audio["file"])
+        before = float(clip["in_sec"]) - start
+        after = (start + float(length) - float(clip["out_sec"])) if length is not None else 0.0
+    else:
+        src = source_of(project, clip)
+        length = (src.get("probe") or {}).get("duration_sec")
+        if length is None:
+            length = durations(src["path"])
+        before = float(clip["in_sec"])
+        after = (float(length) - float(clip["out_sec"])) if length is not None else 0.0
+    return max(0.0, before), max(0.0, after)
+
+
+def joins(project, durations=file_duration):
+    """How each clip's sound meets the previous one, aligned with clips():
+    [{"kind": "cut" | "crossfade" | "blend" | "dip", "sec": seconds}], and for a blend
+    "lead": how much of the overlap lies before the cut.
+
+    A soft cut ("soft_cut") overlaps the two sounds for its length: centred on the cut
+    when both sides have sound to spare, else shifted toward the side that has it (a
+    cleaned piece ending where the original sound goes on blends early, into the
+    original). When the two sides together do not have enough, it dips: the first
+    fades out, the second fades in. Back-to-back clips of one video with the same sound
+    stay a plain cut. Mirrored by joinsOf() in gui/src/lib/edit.ts
+    (tests/data/joins.json).
+    """
+    cs = clips(project)
+    out = [{"kind": "cut", "sec": 0.0}]
+    for i in range(1, len(cs)):
+        (prev, _, plen), (c, _, length) = cs[i - 1], cs[i]
+        tr = c.get("transition_in") or {}
+        sec = float(tr.get("sec") or 0.0)
+        if tr.get("type") == "crossfade" and sec > 0:
+            out.append({"kind": "crossfade", "sec": min(sec, plen / 2, length / 2)})
+            continue
+        if tr.get("type") != "soft_cut" or sec <= 0:
+            out.append({"kind": "cut", "sec": 0.0})
+            continue
+        d = min(sec, plen, length)
+        if (prev["source"] == c["source"] and _sound(prev) == _sound(c)
+                and abs(float(prev["out_sec"]) - float(c["in_sec"])) < 0.02):
+            out.append({"kind": "cut", "sec": 0.0})
+            continue
+        if _sound(prev) == "mute" or _sound(c) == "mute":
+            out.append({"kind": "dip", "sec": d})
+            continue
+        after = spare_sound(project, prev, durations)[1]
+        before = spare_sound(project, c, durations)[0]
+        lead = blend_lead(d, before, after)
+        out.append({"kind": "dip", "sec": d} if lead is None
+                   else {"kind": "blend", "sec": d, "lead": lead})
+    return out
+
+
+def blend_lead(d, before, after):
+    """Where a d-second overlap sits: seconds of it before the cut (the incoming sound
+    must have that much before its in point, the outgoing the rest after its out point).
+    Centred when it can be, else as near the centre as the spare sound allows; None
+    when the two together have less than d."""
+    lo, hi = max(0.0, d - after), min(d, before)
+    if lo > hi + 1e-6:
+        return None
+    return round(min(max(d / 2, lo), hi), 6)
 
 
 def duration(project):
@@ -77,11 +185,102 @@ def duration(project):
     return 0.0 if not cs else cs[-1][1] + cs[-1][2]
 
 
+def owned_spans(project):
+    """Each clip's share of the timeline, crossfades split in the middle:
+    [(clip, start_on_timeline, owned_from, owned_to)]. The spans tile [0, duration]."""
+    cs = clips(project)
+    froms = []
+    for i, (c, start, length) in enumerate(cs):
+        fade = min(transition(c), cs[i - 1][2] / 2, length / 2) if i else 0.0
+        froms.append(start + fade / 2)
+    tos = froms[1:] + [duration(project)]
+    return [(c, start, a, b) for (c, start, _), a, b in zip(cs, froms, tos)]
+
+
+def excerpt(project, t0, t1):
+    """The picture of timeline [t0, t1] as a project of its own (pure): the video clips
+    trimmed to the window, crossfades inside it turned into cuts at their middle, music
+    dropped. Rendering it through video_graph gives that stretch of the export's picture
+    (docs/stitch-and-size-budget-plan.md §10.4)."""
+    out = []
+    for c, start, a, b in owned_spans(project):
+        lo, hi = max(a, t0), min(b, t1)
+        if hi - lo < 1e-3:
+            continue
+        clip = {k: v for k, v in c.items() if k != "transition_in"}
+        if transition(c):
+            clip["zoom_glide"] = False      # it was a crossfade, not a continuing shot
+        clip["in_sec"] = round(float(c["in_sec"]) + lo - start, 6)
+        clip["out_sec"] = round(float(c["in_sec"]) + hi - start, 6)
+        out.append(clip)
+    if not out:
+        raise ProjectError(f"nothing on the timeline between {t0:g} and {t1:g} s")
+    return {**project, "canvas": canvas(project),
+            "tracks": {**(project.get("tracks") or {}), "video": out, "music": []}}
+
+
 def source_of(project, clip):
     src = project.get("sources", {}).get(clip["source"])
     if not src:
         raise ProjectError(f"clip {clip.get('id')} uses an unknown source {clip['source']}")
     return src
+
+
+def ensure_probes(project):
+    """Probe again (in memory) the sources whose embedded probe predates the current
+    probe version, so plan() can compare formats. Missing files are left alone."""
+    for src in (project.get("sources") or {}).values():
+        old = src.get("probe") or {}
+        if (old.get("probe_version") or 1) < probe_mod.PROBE_VERSION and os.path.exists(src["path"]):
+            try:
+                src["probe"] = probe_mod.probe(src["path"])
+            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                pass
+    return project
+
+
+def sar(video):
+    return float((video or {}).get("sar") or 1.0)
+
+
+def display_width(video):
+    """The picture's width once its pixels are square (tape transfers often are not)."""
+    return int(round(int(video["width"]) * sar(video) / 2)) * 2
+
+
+def suggest_canvas(items):
+    """A common frame for clips from different videos.
+
+    items: [{"display_width", "height", "fps", "seconds"}]. The size is the largest
+    picture (ties: the one with more seconds); the frame rate is the one carrying the
+    most seconds (rates within 0.01 count as the same). Mirrored in gui/src/lib/edit.ts.
+    """
+    items = [i for i in items if i.get("display_width") and i.get("height")]
+    if not items:
+        return None
+    big = max(items, key=lambda i: (i["display_width"] * i["height"], i.get("seconds") or 0))
+    rates = []
+    for i in items:
+        fps = float(i.get("fps") or 30)
+        for r in rates:
+            if abs(r[0] - fps) <= 0.01:
+                r[1] += i.get("seconds") or 0
+                break
+        else:
+            rates.append([fps, i.get("seconds") or 0])
+    fps = max(rates, key=lambda r: r[1])[0]
+    return {"width": int(big["display_width"]), "height": int(big["height"]), "fps": fps}
+
+
+def canvas_items(project):
+    """suggest_canvas() input from the project's clips."""
+    items = []
+    for c, _, length in clips(project):
+        video = (source_of(project, c).get("probe") or {}).get("video") or {}
+        if video.get("width"):
+            items.append({"display_width": display_width(video), "height": int(video["height"]),
+                          "fps": float(video.get("fps") or 30), "seconds": length})
+    return items
 
 
 def canvas(project):
@@ -96,7 +295,7 @@ def canvas(project):
     video = probe.get("video") or {}
     if not video.get("width"):
         raise ProjectError("the canvas is not set and the first source has no probe")
-    return {"width": int(video["width"]), "height": int(video["height"]),
+    return {"width": display_width(video), "height": int(video["height"]),
             "fps": float(video.get("fps") or 30)}
 
 
@@ -105,39 +304,105 @@ def settings(project):
 
 
 # ------------------------------------------------------------------ copy or encode
+# What two videos must share for their packets to be joined without re-encoding, with
+# the words a mismatch is reported in.
+_SAME_FORMAT = (("codec", "codecs"), ("width", "picture sizes"), ("height", "picture sizes"),
+                ("pix_fmt", "colour formats"), ("fps", "frame rates"), ("sar", "pixel shapes"),
+                ("field_order", "scan types"), ("profile", "encoder settings"),
+                ("level", "encoder settings"), ("time_base", "encoder settings"),
+                ("extradata_md5", "encoder settings"))
+
+
+def format_difference(videos):
+    """Why these video streams cannot be joined by copying, or None when they can.
+
+    videos: probe "video" dicts, one per distinct source.
+    """
+    if len(videos) < 2:
+        return None
+    if any(not v.get("extradata_md5") for v in videos):
+        return "the videos' formats have not been compared yet"
+    first = videos[0]
+    for v in videos[1:]:
+        for key, words in _SAME_FORMAT:
+            a, b = first.get(key), v.get(key)
+            if key == "fps":
+                same = a is not None and b is not None and abs(float(a) - float(b)) <= 0.01
+            elif key == "sar":
+                same = abs(sar(first) - sar(v)) <= 0.001
+            else:
+                same = a == b
+            if not same:
+                if key in ("width", "height"):
+                    detail = f"{first.get('width')}×{first.get('height')} and {v.get('width')}×{v.get('height')}"
+                elif key in ("codec", "fps"):
+                    detail = f"{a:g} and {b:g}" if key == "fps" and a and b else f"{a} and {b}"
+                else:
+                    detail = None
+                return f"the videos have different {words}" + (f" ({detail})" if detail else "")
+    return None
+
+
+def picture_runs(project):
+    """The picture as continuous runs: back-to-back clips of the same video (one ends where
+    the next begins, no crossfade) are one run, since only their sound differs.
+    Returns [{"source", "in_sec", "out_sec", "clips": [indices]}]."""
+    runs = []
+    for i, (c, _, _) in enumerate(clips(project)):
+        last = runs[-1] if runs else None
+        if (last and last["source"] == c["source"] and not transition(c)
+                and abs(last["out_sec"] - float(c["in_sec"])) < 0.001):
+            last["out_sec"] = float(c["out_sec"])
+            last["clips"].append(i)
+        else:
+            runs.append({"source": c["source"], "in_sec": float(c["in_sec"]),
+                         "out_sec": float(c["out_sec"]), "clips": [i]})
+    return runs
+
+
 def plan(project, keyframe_at=ffmpeg_utils.probe_keyframe_at_or_before):
-    """{"mode": "copy"|"encode", "reasons": [...why not copy...], "duration", "canvas"}."""
+    """{"mode": "copy"|"encode", "reasons": [...why not copy...], "duration", "canvas"}.
+
+    Clips from several videos are copied too, when the videos' streams are identical in
+    format (format_difference) and every cut is on a keyframe of its own video.
+    """
     cs = clips(project)
     if not cs:
         raise ProjectError("the project has no clips")
     cv = canvas(project)
     reasons = []
-    ids = {c["source"] for c, _, _ in cs}
-    if len(ids) > 1:
-        reasons.append("clips come from more than one video")
+    ids = list(dict.fromkeys(c["source"] for c, _, _ in cs))
+    videos = [(source_of(project, {"source": i, "id": i}).get("probe") or {}).get("video") or {}
+              for i in ids]
     if any(transition(c) for c, _, _ in cs[1:]):
         reasons.append("crossfades need re-encoding")
     if any(c.get("video_filters") for c, _, _ in cs):
         reasons.append("visual edits need re-encoding")
-    if len(ids) == 1:
-        probe = (source_of(project, cs[0][0]).get("probe") or {}).get("video") or {}
-        if (probe.get("width"), probe.get("height")) != (cv["width"], cv["height"]):
+    if any(framing(c) for c, _, _ in cs):
+        reasons.append("zoomed clips need re-encoding")
+    different = format_difference(videos)
+    if different:
+        reasons.append(different)
+    else:
+        probe = videos[0]
+        shown = (display_width(probe), probe.get("height")) if probe.get("width") else (None, None)
+        if shown != (cv["width"], cv["height"]):
             reasons.append(f"the canvas ({cv['width']}×{cv['height']}) differs from the "
-                           f"video ({probe.get('width')}×{probe.get('height')})")
+                           f"video ({shown[0]}×{shown[1]})")
         if probe.get("fps") and abs(float(probe["fps"]) - cv["fps"]) > 0.01:
             reasons.append(f"the frame rate changes ({probe['fps']:g} → {cv['fps']:g})")
         if probe.get("field_order") not in (None, "progressive", "unknown"):
             reasons.append("the video is interlaced and gets deinterlaced")
         if not reasons:
-            path = source_of(project, cs[0][0])["path"]
+            # Only where the picture jumps must a cut fall on a keyframe.
             off = []
-            for c, _, _ in cs:
-                start = float(c["in_sec"])
+            for run in picture_runs(project):
+                start = run["in_sec"]
                 if start <= 0:
                     continue
-                k = keyframe_at(path, start)
+                k = keyframe_at(project["sources"][run["source"]]["path"], start)
                 if k is None or abs(k - start) > KEYFRAME_TOLERANCE:
-                    off.append(c.get("id"))
+                    off.append(run["source"])
             if off:
                 reasons.append(f"{len(off)} cut(s) do not start on a keyframe")
     return {"mode": "encode" if reasons else "copy", "reasons": reasons,
@@ -179,31 +444,47 @@ def audio_graph(project, inputs, video_inputs=None):
     chains = []
     cs = clips(project)
     total = duration(project)
+    js = joins(project)
     labels = []
     for i, (c, _, length) in enumerate(cs):
         audio = c.get("audio") or {}
         gain = float(audio.get("gain_db") or 0.0)
+        # A blend borrows sound from beyond the cut: before it for the incoming clip
+        # (its lead), after it for the outgoing one (the rest of the overlap).
+        pre = js[i]["lead"] if js[i]["kind"] == "blend" else 0.0
+        nxt = js[i + 1] if i + 1 < len(cs) else {"kind": "cut", "sec": 0.0}
+        post = nxt["sec"] - nxt["lead"] if nxt["kind"] == "blend" else 0.0
+        span = length + pre + post
         if audio.get("mute"):
-            idx = inputs.add(f"anullsrc=r={SAMPLE_RATE}:cl=stereo", length=length, lavfi=True)
+            idx = inputs.add(f"anullsrc=r={SAMPLE_RATE}:cl=stereo", length=span, lavfi=True)
         elif audio.get("file"):
             offset = float(c["in_sec"]) - float(audio.get("start_sec") or 0.0)
             if offset < -0.05:
                 raise ProjectError(f"clip {c.get('id')} starts before its cleaned audio")
-            idx = inputs.add(audio["file"], max(0.0, offset), length)
+            idx = inputs.add(audio["file"], max(0.0, offset - pre), span)
         else:
-            idx = (video_inputs or {}).get(i)
+            idx = (video_inputs or {}).get(i) if not (pre or post) else None
             if idx is None:
-                idx = inputs.add(source_of(project, c)["path"], float(c["in_sec"]), length)
-        chains.append(f"[{idx}:a:0]asetpts=PTS-STARTPTS,{AFMT},apad,"
-                      f"atrim=duration={length:.6f},volume={gain:g}dB[a{i}]")
+                idx = inputs.add(source_of(project, c)["path"], float(c["in_sec"]) - pre, span)
+        chain = (f"[{idx}:a:0]asetpts=PTS-STARTPTS,{AFMT},apad,"
+                 f"atrim=duration={span:.6f},volume={gain:g}dB")
+        # A dip fades the sound out at the end of one clip and in at the start of the next.
+        if js[i]["kind"] == "dip":
+            chain += f",afade=t=in:st=0:d={js[i]['sec'] / 2:.6f}:curve=qsin"
+        if nxt["kind"] == "dip":
+            chain += f",afade=t=out:st={length - nxt['sec'] / 2:.6f}:d={nxt['sec'] / 2:.6f}:curve=qsin"
+        chains.append(chain + f"[a{i}]")
         labels.append(f"a{i}")
-    # Join like the picture: hard cuts concatenate, crossfades overlap.
+    # Join like the picture: hard cuts and dips concatenate, crossfades overlap, and a
+    # blend overlaps the borrowed sound on both sides of the cut (the length stays).
     cur = labels[0]
     for i in range(1, len(cs)):
-        fade = min(transition(cs[i][0]), cs[i - 1][2] / 2, cs[i][2] / 2)
+        j = js[i]
         nxt = f"aj{i}"
-        if fade > 0:
-            chains.append(f"[{cur}][{labels[i]}]acrossfade=d={fade:.6f}:c1=tri:c2=tri[{nxt}]")
+        if j["kind"] == "crossfade":
+            chains.append(f"[{cur}][{labels[i]}]acrossfade=d={j['sec']:.6f}:c1=tri:c2=tri[{nxt}]")
+        elif j["kind"] == "blend":
+            chains.append(f"[{cur}][{labels[i]}]acrossfade=d={j['sec']:.6f}:c1=qsin:c2=qsin[{nxt}]")
         else:
             chains.append(f"[{cur}][{labels[i]}]concat=n=2:v=0:a=1[{nxt}]")
         cur = nxt
@@ -281,21 +562,113 @@ def _deinterlace(project, clip):
     return probe.get("field_order") not in (None, "progressive", "unknown")
 
 
+def framing(c):
+    """A clip's zoom: {x, y, w, h} as fractions of its (square-pixel) picture, or None for the whole."""
+    f = c.get("frame")
+    if not f:
+        return None
+    w, h = (min(1.0, max(0.02, float(f.get(k, 1)))) for k in ("w", "h"))
+    x = min(1.0 - w, max(0.0, float(f.get("x", 0))))
+    y = min(1.0 - h, max(0.0, float(f.get("y", 0))))
+    if w > 0.999 and h > 0.999:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def crop_filter(f):
+    """The ffmpeg crop for a framing (even sizes, so any encoder takes them)."""
+    return (f"crop=w=trunc(iw*{f['w']:.6f}/2)*2:h=trunc(ih*{f['h']:.6f}/2)*2"
+            f":x=trunc(iw*{f['x']:.6f}):y=trunc(ih*{f['y']:.6f})")
+
+
+# ------------------------------------------------------------------ zoom glides
+ZOOM_GLIDE_SEC = 1.0
+
+
+def _same_frame(a, b):
+    if not a or not b:
+        return not a and not b
+    return all(abs(a[k] - b[k]) < 1e-4 for k in ("x", "y", "w", "h"))
+
+
+def zoom_glide(prev, c):
+    """The glide into c ({from, to, sec}, frames as framing() gives them), or None.
+
+    Where c continues prev's shot (same video, no gap) with another framing, the picture
+    moves from prev's framing to c's over c's first `sec` seconds, eased. c["zoom_glide"]:
+    absent = ZOOM_GLIDE_SEC, False = a plain cut, {"sec": n} = another length. Mirrors
+    zoomGlide() in gui/src/lib/edit.ts."""
+    if prev is None or prev.get("source") != c.get("source"):
+        return None
+    if abs(float(prev["out_sec"]) - float(c["in_sec"])) > 0.05:
+        return None
+    if (c.get("transition_in") or {}).get("type") == "crossfade" or c.get("zoom_glide") is False:
+        return None
+    a, b = framing(prev), framing(c)
+    if _same_frame(a, b):
+        return None
+    sec = min(float((c.get("zoom_glide") or {}).get("sec", ZOOM_GLIDE_SEC)),
+              float(c["out_sec"]) - float(c["in_sec"]))
+    return {"from": a, "to": b, "sec": sec} if sec > 0.04 else None
+
+
+def _canvas_rect(f, picture, shape):
+    """A framing as (left, top, size) fractions of the output-shaped canvas the whole picture
+    sits in (letterboxed or pillarboxed); None = the whole canvas."""
+    if picture >= shape:
+        pw, ph, ox, oy = 1.0, shape / picture, 0.0, (1 - shape / picture) / 2
+    else:
+        pw, ph, ox, oy = picture / shape, 1.0, (1 - picture / shape) / 2, 0.0
+    if f is None:
+        return 0.0, 0.0, 1.0
+    return ox + f["x"] * pw, oy + f["y"] * ph, f["w"] * pw
+
+
+def glide_filters(g, picture, shape, w, h, src_fps):
+    """Steps that put the whole picture in an output-shaped canvas at its own resolution and
+    move a zoompan window from one framing to the other (smoothstep easing)."""
+    if picture >= shape:
+        pad = f"pad=w=iw:h=trunc(iw/{shape:.6f}/2)*2:x=0:y=(oh-ih)/2:color=black"
+    else:
+        pad = f"pad=w=trunc(ih*{shape:.6f}/2)*2:h=ih:x=(ow-iw)/2:y=0:color=black"
+    u0, v0, s0 = _canvas_rect(g["from"], picture, shape)
+    u1, v1, s1 = _canvas_rect(g["to"], picture, shape)
+    e = f"clip(it/{g['sec']:.6f},0,1)"
+    k = f"({e}*{e}*(3-2*{e}))"
+    mix = lambda a, b: f"({a:.6f}+({b - a:.6f})*{k})"
+    zp = (f"zoompan=z='1/{mix(s0, s1)}':x='{mix(u0, u1)}*iw':y='{mix(v0, v1)}*ih'"
+          f":d=1:s={w}x{h}:fps={src_fps:.6f}")
+    return [pad, zp]
+
+
 def video_graph(project, inputs, cv):
     """Per-clip picture chains joined into [video]; returns (chains, {clip: input})."""
     chains, used = [], {}
     cs = clips(project)
     w, h, fps = cv["width"], cv["height"], cv["fps"]
     for i, (c, _, length) in enumerate(cs):
+        glide = zoom_glide(cs[i - 1][0] if i else None, c)
         idx = inputs.add(source_of(project, c)["path"], float(c["in_sec"]), length)
         used[i] = idx
         steps = ["setpts=PTS-STARTPTS"]
         if _deinterlace(project, c):
             steps.append("bwdif=mode=send_frame")
-        steps += list(c.get("video_filters") or [])
-        steps += [f"scale={w}:{h}:force_original_aspect_ratio=decrease",
-                  f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black", "setsar=1",
-                  f"fps={fps:g}", "format=yuv420p", f"trim=duration={length:.6f}",
+        if abs(sar((source_of(project, c).get("probe") or {}).get("video")) - 1) > 0.001:
+            steps += ["scale=trunc(iw*sar/2)*2:ih", "setsar=1"]
+        f = framing(c)
+        if glide:
+            v = (source_of(project, c).get("probe") or {}).get("video") or {}
+            picture = display_width(v) / int(v["height"]) if v.get("height") else w / h
+            steps += list(c.get("video_filters") or [])
+            steps += glide_filters(glide, picture, w / h, w, h, float(v.get("fps") or fps))
+            steps += ["setsar=1"]
+        else:
+            if f:
+                steps.append(crop_filter(f))
+            steps += list(c.get("video_filters") or [])
+            steps += [f"scale={w}:{h}:force_original_aspect_ratio=decrease" + (":flags=lanczos" if f else ""),
+                      f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black", "setsar=1"]
+        steps += [f"fps={fps:g}", "format=yuv420p", f"trim=duration={length:.6f}",
                   "setpts=PTS-STARTPTS"]
         chains.append(f"[{idx}:v:0]{','.join(steps)}[v{i}]")
     cur, t = "v0", cs[0][2]
@@ -314,13 +687,64 @@ def video_graph(project, inputs, cv):
     return chains, used
 
 
-def encoder_args(s, cv):
-    if s.get("encoder") == "h264_videotoolbox":
-        rate = next(r for limit, r in FAST_BITRATES if cv["height"] <= limit)
-        return ["-c:v", "h264_videotoolbox", "-b:v", rate, "-profile:v", "high",
-                "-pix_fmt", "yuv420p"]
-    return ["-c:v", "libx264", "-crf", str(int(s.get("crf", 18))), "-preset",
-            str(s.get("preset", "medium")), "-profile:v", "high", "-pix_fmt", "yuv420p"]
+CEILING_CRF = {"libx264": 18.0, "libx265": 20.0}     # visually lossless (§10.4)
+
+
+def encoder_args(s, cv, rate=None):
+    """The video encoder's arguments.
+
+    rate None with H.264: today's fixed-quality settings, unchanged. Otherwise (HEVC, or a
+    budgeted encode, docs/stitch-and-size-budget-plan.md §10.5) rate may hold "crf" (a
+    constant quality, default the codec's ceiling), "bps" (a bitrate), "pass" (1 or 2)
+    with "log" (the stats file prefix), and "hardware" (VideoToolbox at "bps").
+    """
+    hevc = s.get("codec") == "hevc"
+    hardware = s.get("encoder") == "h264_videotoolbox" or s.get("fast")
+    if rate is None and not hevc and not s.get("fast"):
+        if hardware:
+            rate = next(r for limit, r in FAST_BITRATES if cv["height"] <= limit)
+            return ["-c:v", "h264_videotoolbox", "-b:v", rate, "-profile:v", "high",
+                    "-pix_fmt", "yuv420p"]
+        return ["-c:v", "libx264", "-crf", str(int(s.get("crf", 18))), "-preset",
+                str(s.get("preset", "medium")), "-profile:v", "high", "-pix_fmt", "yuv420p"]
+    rate = rate or {}
+    gop = ["-g", str(max(1, round(2 * float(cv["fps"]))))]
+    if rate.get("hardware") or (hardware and not rate):
+        bps = rate.get("bps") or next(r for limit, r in FAST_BITRATES if cv["height"] <= limit)
+        args = ["-c:v", "hevc_videotoolbox" if hevc else "h264_videotoolbox", "-b:v", str(bps)]
+        args += ["-tag:v", "hvc1"] if hevc else ["-profile:v", "high"]
+        return args + ["-pix_fmt", "yuv420p", *gop]
+    lib = "libx265" if hevc else "libx264"
+    args = ["-c:v", lib, "-preset", str(s.get("preset", "medium"))]
+    if rate.get("bps"):
+        args += ["-b:v", str(int(rate["bps"]))]
+    else:
+        args += ["-crf", f"{float(rate.get('crf', CEILING_CRF[lib])):g}"]
+    if hevc:
+        params = ["log-level=error"]
+        if rate.get("pass"):
+            params += [f"pass={int(rate['pass'])}", f"stats={rate['log']}.log"]
+        args += ["-x265-params", ":".join(params), "-tag:v", "hvc1"]
+    else:
+        args += ["-profile:v", "high"]
+        if rate.get("pass"):
+            args += ["-pass", str(int(rate["pass"])), "-passlogfile", str(rate["log"])]
+    return args + ["-pix_fmt", "yuv420p", *gop]
+
+
+def encoder_name(s, rate=None):
+    """The encoder encoder_args() picks, for messages."""
+    args = encoder_args(s, {"width": 2, "height": 2, "fps": 30}, rate)
+    return args[args.index("-c:v") + 1]
+
+
+def pass1_command(project, s, cv, rate):
+    """The analysis pass of a two-pass encode: the picture only, nothing written."""
+    inputs = Inputs()
+    vchains, _ = video_graph(project, inputs, cv)
+    return ["ffmpeg", "-y", *inputs.args, "-filter_complex", ";".join(vchains),
+            "-map", "[video]", *encoder_args(s, cv, {**rate, "pass": 1}), "-an",
+            "-t", f"{duration(project):.6f}", "-f", "null", "-"]
 
 
 def measure_command(project, s):
@@ -331,24 +755,25 @@ def measure_command(project, s):
             "-filter_complex", graph, "-map", "[out]", "-f", "null", "-"]
 
 
-def encode_command(project, s, out, measured, cv):
+def encode_command(project, s, out, measured, cv, rate=None, extra=()):
     inputs = Inputs()
     vchains, used = video_graph(project, inputs, cv)
     achains, label = audio_graph(project, inputs, video_inputs=used)
     tail = f"[{label}]{loudness(s, measured)}[aout]"
     graph = ";".join(vchains + achains + [tail])
     return ["ffmpeg", "-y", *inputs.args, "-filter_complex", graph,
-            "-map", "[video]", "-map", "[aout]", *encoder_args(s, cv),
+            "-map", "[video]", "-map", "[aout]", *encoder_args(s, cv, rate),
             "-c:a", "aac", "-b:a", str(s["audio_bitrate"]), "-ar", str(SAMPLE_RATE),
-            "-ac", "2", "-t", f"{duration(project):.6f}", "-movflags", "+faststart", str(out)]
+            "-ac", "2", "-t", f"{duration(project):.6f}", *extra, "-movflags", "+faststart",
+            str(out)]
 
 
 def concat_list(project):
     lines = ["ffconcat version 1.0"]
-    for c, _, _ in clips(project):
-        path = source_of(project, c)["path"].replace("'", "'\\''")
-        lines += [f"file '{path}'", f"inpoint {float(c['in_sec']):.6f}",
-                  f"outpoint {float(c['out_sec']):.6f}"]
+    for run in picture_runs(project):
+        path = project["sources"][run["source"]]["path"].replace("'", "'\\''")
+        lines += [f"file '{path}'", f"inpoint {run['in_sec']:.6f}",
+                  f"outpoint {run['out_sec']:.6f}"]
     return "\n".join(lines) + "\n"
 
 
@@ -369,6 +794,34 @@ def copy_commands(project, s, out, measured, work):
     return audio, mux
 
 
+def verify_copy(path, joins, expected_sec, fps):
+    """Check a stream-copied export: the picture decodes cleanly around every join and
+    the video lasts as long as the timeline. Returns None, or what went wrong."""
+    for t in joins:
+        start = max(0.0, t - 1.0)
+        out = subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-ss", f"{start:.3f}",
+                              "-t", "3", "-i", str(path), "-map", "0:v:0", "-f", "null", "-"],
+                             capture_output=True, text=True)
+        if out.returncode != 0 or out.stderr.strip():
+            return f"the picture does not decode cleanly at {_clock(t)}"
+    info = json.loads(subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=duration", "-of", "json", str(path)],
+        capture_output=True, text=True).stdout or "{}")
+    try:
+        got = float(info["streams"][0]["duration"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return "the result's length could not be read"
+    if abs(got - expected_sec) > 2.0 / fps + 0.001:
+        return f"the video lasts {got:.2f} s instead of {expected_sec:.2f} s"
+    return None
+
+
+def _clock(t):
+    t = int(round(t))
+    return f"{t // 3600}:{t // 60 % 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
+
+
 # ------------------------------------------------------------------ running it
 def output_path(project, project_path):
     s = settings(project)
@@ -379,19 +832,34 @@ def output_path(project, project_path):
     return Path(project_path).resolve().parent.parent.parent / f"{name}.mp4"
 
 
-def run(project_path, out=None, force_encode=False):
-    project = load(project_path)
-    s = settings(project)
-    out = Path(out) if out else output_path(project, project_path)
+def check_files(project):
     for c, _, _ in clips(project):
         for path in (source_of(project, c)["path"], (c.get("audio") or {}).get("file")):
             if path and not os.path.exists(path):
                 raise ProjectError(f"missing file: {path}")
+
+
+def run(project_path, out=None, force_encode=False, overrides=None):
+    """Export the project. overrides: command-line values for the size-budget keys
+    (budget, codec, height, fast, one_pass; docs/stitch-and-size-budget-plan.md §10)."""
+    from . import sizing
+    project = ensure_probes(load(project_path))
+    s = sizing.with_overrides(settings(project), overrides)
+    out = Path(out) if out else output_path(project, project_path)
+    check_files(project)
+    if s.get("budget"):
+        return sizing.run(project_path, project, s, out, force_encode)
     total_steps = 3
     print_step(1, total_steps, "Checking the cuts")
     p = plan(project)
     if force_encode and p["mode"] == "copy":
         p = {**p, "mode": "encode", "reasons": ["re-encoding was asked for"]}
+    shown = sizing.output_canvas(p["canvas"], s.get("height"))
+    if shown != p["canvas"]:
+        p = {**p, "canvas": shown}
+        if p["mode"] == "copy":
+            p = {**p, "mode": "encode", "reasons": [f"the picture is made smaller "
+                                                    f"({shown['width']}×{shown['height']})"]}
     total = p["duration"]
     if p["mode"] == "copy":
         print_success(f"Lossless: the video is copied as is ({total:.1f} s).")
@@ -399,15 +867,7 @@ def run(project_path, out=None, force_encode=False):
         print_info("Re-encoding the video: " + "; ".join(p["reasons"]) + ".")
 
     print_step(2, total_steps, "Measuring loudness")
-    cmd = measure_command(project, s)
-    from .postprocess import parse_ebur128_summary
-    measured = parse_ebur128_summary(ffmpeg_utils.run_ffmpeg(cmd, total, "Measuring"))
-    if measured[0] is None:
-        print_warning("The audio is near silent; loudness is left as it is.")
-    else:
-        print_info(f"Measured {measured[0]:.1f} LUFS (true peak {measured[1]:.1f} dBTP); "
-                   f"gain {gain_db(s, measured):+.1f} dB to reach "
-                   f"{float(s['target_lufs']):g} LUFS.")
+    measured = measure(project, s, total)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.stem + ".partial" + out.suffix)
@@ -415,15 +875,13 @@ def run(project_path, out=None, force_encode=False):
     work = tempfile.mkdtemp(prefix="vac_export_")
     procs.register_path(work)
     try:
+        verified = None
         if p["mode"] == "copy":
             print_step(3, total_steps, "Writing (video copied, audio encoded)")
-            audio_cmd, mux = copy_commands(project, s, partial, measured, work)
-            ffmpeg_utils.run_ffmpeg(audio_cmd, total, "Audio")
-            ffmpeg_utils.run_ffmpeg(mux, total, "Writing")
-            commands = [audio_cmd, mux]
-        else:
+            commands, verified, p = write_copy(project, s, partial, measured, work, p)
+        if p["mode"] == "encode":
             print_step(3, total_steps, f"Encoding {p['canvas']['width']}×"
-                                       f"{p['canvas']['height']} ({s['encoder']})")
+                                       f"{p['canvas']['height']} ({encoder_name(s)})")
             cmd = encode_command(project, s, partial, measured, p["canvas"])
             ffmpeg_utils.run_ffmpeg(cmd, total, "Encoding")
             commands = [cmd]
@@ -434,10 +892,57 @@ def run(project_path, out=None, force_encode=False):
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 
-    result = {"mode": p["mode"], "reasons": p["reasons"], "duration_sec": round(total, 3),
-              "canvas": p["canvas"], "measured_lufs": measured[0],
-              "measured_true_peak_dbtp": measured[1], "gain_db": round(gain_db(s, measured), 2),
-              "target_lufs": float(s["target_lufs"])}
+    result = base_result(p, s, measured)
+    if verified is not None:
+        result["copy_verified"] = verified
+    finish(out, project_path, project, commands, result)
+    return out, result
+
+
+def measure(project, s, total):
+    """The mix's loudness (integrated LUFS, true peak), measured on an audio-only pass."""
+    from .postprocess import parse_ebur128_summary
+    measured = parse_ebur128_summary(ffmpeg_utils.run_ffmpeg(measure_command(project, s),
+                                                             total, "Measuring"))
+    if measured[0] is None:
+        print_warning("The audio is near silent; loudness is left as it is.")
+    else:
+        print_info(f"Measured {measured[0]:.1f} LUFS (true peak {measured[1]:.1f} dBTP); "
+                   f"gain {gain_db(s, measured):+.1f} dB to reach "
+                   f"{float(s['target_lufs']):g} LUFS.")
+    return measured
+
+
+def write_copy(project, s, partial, measured, work, p):
+    """The lossless path, checked at the joins. Returns (commands, verified, plan); the plan
+    turns to "encode" (and partial is gone) when the joins did not hold."""
+    total = p["duration"]
+    audio_cmd, mux = copy_commands(project, s, partial, measured, work)
+    ffmpeg_utils.run_ffmpeg(audio_cmd, total, "Audio")
+    ffmpeg_utils.run_ffmpeg(mux, total, "Writing")
+    verified = None
+    cs = clips(project)
+    runs = picture_runs(project)
+    if len(runs) > 1:
+        joins = [cs[run["clips"][0]][1] for run in runs[1:]]
+        problem = verify_copy(partial, joins, total, p["canvas"]["fps"])
+        verified = problem is None
+        if problem:
+            print_warning(f"Lossless joining did not hold ({problem}); encoding instead.")
+            partial.unlink(missing_ok=True)
+            p = {**p, "mode": "encode", "reasons": [f"lossless joining failed: {problem}"]}
+    return [audio_cmd, mux], verified, p
+
+
+def base_result(p, s, measured):
+    return {"mode": p["mode"], "reasons": p["reasons"], "duration_sec": round(p["duration"], 3),
+            "canvas": p["canvas"], "measured_lufs": measured[0],
+            "measured_true_peak_dbtp": measured[1], "gain_db": round(gain_db(s, measured), 2),
+            "target_lufs": float(s["target_lufs"])}
+
+
+def finish(out, project_path, project, commands, result):
+    """Write the .params.json sidecar and emit the result event."""
     sidecar = out.with_suffix(".params.json")
     from .provenance import environment
     sidecar.write_text(json.dumps({
@@ -448,7 +953,7 @@ def run(project_path, out=None, force_encode=False):
         "environment": environment()}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     events.emit("result", output=str(out), sidecar=str(sidecar), replaced=False, results=result)
     print_success(f"Exported {out}")
-    return out, result
+    return sidecar
 
 
 def build_parser():
@@ -462,8 +967,41 @@ def build_parser():
                    help="Re-encode the video even when it could be copied.")
     p.add_argument("--plan", action="store_true",
                    help="Only say whether the export would be lossless, and why not.")
+    size = p.add_argument_group(
+        "size budget", "Find the best quality that fits, trying short samples first "
+        "(docs/stitch-and-size-budget-plan.md §10). 1 GB = 10^9 bytes.")
+    which = size.add_mutually_exclusive_group()
+    which.add_argument("--budget", default=None, metavar="SIZE/h",
+                       help="Size per hour of video: 2GB/h, '2 GB/hour', 1500MB/h. "
+                            "Overrides the project's export.budget.")
+    which.add_argument("--size", default=None, metavar="SIZE",
+                       help="Size of the whole file: 2.5GB, 900MB.")
+    size.add_argument("--codec", choices=("h264", "hevc"), default=None,
+                      help="hevc (smaller, tagged hvc1 for Apple players; the default under "
+                           "a budget) or h264 (plays everywhere; the default otherwise).")
+    size.add_argument("--height", type=int, default=None, metavar="N",
+                      help="Scale the picture down to N lines (never up).")
+    size.add_argument("--fast", action="store_true", default=None,
+                      help="Under a budget: Apple's hardware encoder at the budget's "
+                           "bitrate (much faster, lower quality).")
+    size.add_argument("--one_pass", action="store_true", default=None,
+                      help="When the budget is tight: one pass at the quality the samples "
+                           "found instead of two passes at the budget's bitrate (faster; "
+                           "the size can miss by about 10%%).")
+    size.add_argument("--estimate", action="store_true",
+                      help="Only try the samples: print the estimate and write "
+                           "estimate.json beside the project. No video is written.")
     events.add_argument(p)
     return p
+
+
+def overrides_of(args):
+    """The size-budget keys the command line sets (None = the project's)."""
+    from . import sizing
+    budget = (sizing.parse_budget(args.budget) if args.budget else
+              sizing.parse_size(args.size) if args.size else None)
+    return {"budget": budget, "codec": args.codec, "height": args.height,
+            "fast": args.fast, "one_pass": args.one_pass}
 
 
 def main(argv=None):
@@ -473,12 +1011,17 @@ def main(argv=None):
                         args.progress):
         try:
             if args.plan:
-                p = plan(load(args.project))
+                p = plan(ensure_probes(load(args.project)))
                 events.emit("result", output=None, sidecar=None, replaced=False, results=p)
                 if not events.enabled():
                     print(json.dumps(p, indent=2))
                 return
-            run(args.project, args.output, args.reencode)
+            overrides = overrides_of(args)
+            if args.estimate:
+                from . import sizing
+                sizing.run_estimate(args.project, overrides, args.reencode)
+                return
+            run(args.project, args.output, args.reencode, overrides)
         except KeyboardInterrupt:
             procs.cleanup_all()
             print_warning("Interrupted — cleaned up.")

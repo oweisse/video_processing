@@ -217,6 +217,10 @@ def build_parser():
                         help="Level to mix the separated music back under the speech "
                              "(default: -12). Pass 'off' to drop music entirely. With "
                              "--autotune it is chosen per window unless you give it.")
+    parser.add_argument("--no_music_gate", action="store_true",
+                        help="With --separate_music: mix the whole separated stem back. By "
+                             "default only its music is kept; the room, crowd and noise Demucs "
+                             "also puts there are turned down where no music plays.")
     parser.add_argument("--separation_device", type=str, default="auto",
                         choices=("auto", "cpu", "mps"),
                         help="Device for Demucs (default: auto = try MPS, fall back to CPU).")
@@ -878,6 +882,7 @@ def _run(args, argv=None):
                 duration_sec=work_duration,
                 device=args.separation_device,
                 segment=segment,
+                gate_music=not args.no_music_gate,
             )
             speech_wav = vocals_wav
             print_success("Speech and music stems separated.")

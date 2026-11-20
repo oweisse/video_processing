@@ -302,7 +302,7 @@ def evaluate_window(video, window, grid, separate_music, work, music=None):
     if separate_music:
         speech, music_wav = os.path.join(work, "vocals.wav"), os.path.join(work, "music.wav")
         _quiet(separation.separate_to_files, raw, speech, music_wav,
-               SAMPLE_RATE, duration_sec=window.duration)
+               SAMPLE_RATE, duration_sec=window.duration, gate_music=True)
         music = music if music is not None else {}
         x_raw, sr = M.load_mono(raw)
         x_speech, _ = M.load_mono(speech)
@@ -664,7 +664,9 @@ def default_tune_dir(output_dir, video, separate_music=False):
 
     Music separation changes every measurement, so it gets its own cache.
     """
-    name = Path(video).stem + ("-with-music" if separate_music else "")
+    # "-gated": since the music bed keeps only its music (musicgate.py); tunings made
+    # with the whole stem mixed back stay in "-with-music" and are not reused.
+    name = Path(video).stem + ("-with-music-gated" if separate_music else "")
     return Path(output_dir) / "_tuning" / name
 
 

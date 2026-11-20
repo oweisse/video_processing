@@ -12,7 +12,7 @@ describe("pieces", () => {
   it("lists outputs and tuned windows in time order, outputs first at the same start", () => {
     expect(list.map((p) => p.key)).toEqual(["out:a.mp4", "tuned:/p/plan.json#00m05s-00m25s", "out:late.mp4"]);
     expect(list[0].detail).toBe("gui");
-    expect(list[1].detail).toBe("2 candidates");
+    expect(list[1].detail).toBe("2 candidates · music removed");
   });
 
   it("skips comparison renders and treats a run without a window as the whole video", () => {

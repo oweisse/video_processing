@@ -3,13 +3,13 @@
   // The Media workspace's right panel; Enhance shows it until a window is picked.
   import { api, type Output, type Plan, type Source } from "../lib/api";
   import { ltr } from "../lib/bidi";
-  import { audioFor, coveringOutput, newId } from "../lib/edit";
   import { links } from "../lib/router.svelte";
   import { loadLibrary, reportError, store, toast } from "../lib/state.svelte";
   import { formatBytes, formatDuration } from "../lib/time";
   import PieceBar from "../enhance/PieceBar.svelte";
   import Icon from "../components/Icon.svelte";
   import SourceStrip from "../components/SourceStrip.svelte";
+  import AddToProject from "./AddToProject.svelte";
 
   let { source: s }: { source: Source } = $props();
 
@@ -65,7 +65,7 @@
   }
 
   async function remove(o: Output) {
-    if (!confirm(`Move ${o.file} and its .params.json to the project's _trash folder?`)) return;
+    if (!confirm(`Move ${o.file} and its .params.json to the library folder's _trash folder?`)) return;
     try {
       await api.deleteOutput(o.file);
       toast(`Moved ${ltr(o.file)} to _trash`);
@@ -86,32 +86,13 @@
     }
   }
 
-  // Append the whole video to a timeline (the editor trims it later).
-  let target = $state("");
-  const timelines = $derived(store.library?.projects ?? []);
-  $effect(() => {
-    if (!timelines.some((p) => p.name === target)) target = timelines[0]?.name ?? "";
-  });
-  async function addToTimeline() {
-    const length = s.probe?.duration_sec;
-    if (!target || !length) return;
-    try {
-      const p = await api.getProject(target);
-      const out = coveringOutput(s, 0, length);
-      p.sources[s.id] = { path: s.path, probe: s.probe };
-      p.tracks.video.push({ id: newId(), source: s.id, in_sec: 0, out_sec: length, audio: audioFor(out) });
-      await api.saveProject(target, p);
-      await loadLibrary();
-      toast(`Added ${ltr(s.name)} to ${ltr(target)}`);
-    } catch (e) {
-      reportError(e);
-    }
-  }
 </script>
 
 <div class="details col">
   <div class="title row">
     <h2 class="ellipsis" title={s.path}>{ltr(s.name)}</h2>
+    <span class="spacer"></span>
+    <AddToProject sources={[s]} />
     {#if !s.exists}<span class="chip failed">missing</span>{/if}
   </div>
   <SourceStrip source={s} fill />
@@ -142,6 +123,7 @@
         <div class="row actions">
           <a href={links.output(o.file)}><button class="small" disabled={!o.exists || o.kind === "compare"}>Compare</button></a>
           {#if tuned}<a href={links.candidates(tuned.plan.path, tuned.label)}><button class="small">Candidates</button></a>{/if}
+          {#if o.exists && o.kind === "video" && o.window}<AddToProject sources={[s]} piece={o} label="Add to a project" />{/if}
           <a href={rerun(o)}><button class="small" disabled={!s.exists}>Re-run…</button></a>
           <span class="spacer"></span>
           <button class="icon ghost" title="Reveal in Finder" aria-label="Reveal in Finder" disabled={!o.exists}
@@ -170,16 +152,6 @@
       <div class="row head"><h3>Editing</h3></div>
       {#if s.prep?.proxy && s.prep.thumbs}
         <div class="row"><span class="ok">Ready to edit</span></div>
-        {#if timelines.length}
-          <div class="row">
-            <select bind:value={target} class="grow">
-              {#each timelines as p (p.name)}<option value={p.name}>{ltr(p.name)}</option>{/each}
-            </select>
-            <button class="small" onclick={addToTimeline}>Add to timeline</button>
-          </div>
-        {:else}
-          <p class="faint">No timelines yet: create one in <a href="#/edit">Edit</a>.</p>
-        {/if}
       {:else if prepJob}
         <div class="row">
           <span class="dim">{prepJob.step?.title ?? "Waiting…"}{prepJob.progress?.total_sec ? ` · ${Math.round((100 * prepJob.progress.processed_sec) / prepJob.progress.total_sec)} %` : ""}</span>
@@ -212,7 +184,6 @@
   .output.missing { opacity: 0.5; }
   .actions { gap: 4px; margin-top: 2px; }
   .plans { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-  .grow { flex: 1; min-width: 0; }
   .bar { margin: 0 -10px; }
   .bar :global(.piecebar) { background: none; border-top: none; }
   button.danger:hover { color: var(--danger); }

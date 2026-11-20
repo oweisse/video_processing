@@ -143,7 +143,7 @@ def test_incompatible_tuning_is_archived_not_overwritten(tmp_path, fake_render, 
 def test_default_tune_dir_is_per_video():
     from pathlib import Path
     assert tune.default_tune_dir("/out", "/v/04-.mp4") == Path("/out/_tuning/04-")
-    assert tune.default_tune_dir("/out", "/v/a.mov", True) == Path("/out/_tuning/a-with-music")
+    assert tune.default_tune_dir("/out", "/v/a.mov", True) == Path("/out/_tuning/a-with-music-gated")
 
 
 def test_digital_source_tunes_without_hiss_or_declick(tmp_path, fake_render):

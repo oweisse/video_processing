@@ -3,7 +3,7 @@
   // (docs/gui-design.md §6.3).
   import { onDestroy } from "svelte";
   import { api, media, type CandidateMeasure, type Job, type Output, type PlanWindow } from "../lib/api";
-  import { links, shell } from "../lib/router.svelte";
+  import { href, links, shell } from "../lib/router.svelte";
   import { ltr } from "../lib/bidi";
   import { ABPlayer } from "../lib/abplayer";
   import { audioContext, decode, type Decoded } from "../lib/audio";
@@ -12,8 +12,38 @@
   import { followClock } from "../lib/videosync";
   import ABDeck from "../components/ABDeck.svelte";
   import Scatter from "../components/Scatter.svelte";
+  import CandidateSettings from "../components/CandidateSettings.svelte";
+  import { versionName } from "../media/pieces";
+  import { deleteVersion } from "../media/versions";
+  import Modal from "../components/Modal.svelte";
+  import NewRun from "./NewRun.svelte";
 
-  let { planPath, label }: { planPath: string; label: string } = $props();
+  let { planPath, label, onqueued, ondeleted }: {
+    planPath: string;
+    label: string;
+    /** This tuned window was deleted (the editor closes its dialog; the page goes back to the video). */
+    ondeleted?: () => void;
+    /** A new clean of this window was queued from here (the editor then waits for it). */
+    onqueued?: () => void;
+  } = $props();
+
+  // One more clean of this window, with settings chosen afresh (music kept or removed,
+  // autotune or fixed settings, advanced options): the full clean form, filled in.
+  let cleaningAgain = $state(false);
+
+  // Renaming a rendered version: its label is the tag in its file name.
+  let renaming = $state<string | null>(null);
+  let newTag = $state("");
+  async function saveName(o: Output) {
+    try {
+      const r = await api.renameOutput(o.file, newTag.trim());
+      renaming = null;
+      await loadLibrary();
+      toast(`Renamed to ${r.file}` + (r.projects.length ? ` · updated ${r.projects.join(", ")}` : ""));
+    } catch (e) {
+      reportError(e);
+    }
+  }
 
   const found = $derived(store.library ? findPlan(planPath) : null);
   const plan = $derived(found?.plan ?? null);
@@ -191,6 +221,22 @@
       reportError(e);
     }
   }
+  async function deleteTuning() {
+    if (!plan || !win || !confirm(
+      `Delete this tuning run of ${formatClock(win.start_sec, false)}–${formatClock(win.end_sec, false)}: its ` +
+      `${win.candidates.length} candidates, their measurements and kept audio?\n\nThey go to the library's _trash ` +
+      `folder. Versions already rendered from them stay.`)) return;
+    const sourceId = source?.id;
+    try {
+      await api.deleteTuning(plan.path, label);
+      await loadLibrary();
+      toast("Tuning run deleted (moved to _trash)");
+      if (ondeleted) ondeleted();
+      else location.hash = href(["enhance", ...(sourceId ? [sourceId] : [])]);
+    } catch (e) {
+      reportError(e);
+    }
+  }
   async function measureAgain() {
     if (!plan || !source || !win) return;
     try {
@@ -217,8 +263,24 @@
   {:else}
     <div class="row">
       <span class="chip">{plan.source_kind}</span>
-      {#if plan.separate_music}<span class="chip">music separated{win.music ? `, bed ${win.music.level_db ?? "off"} dB` : ""}</span>{/if}
+      {#if plan.separate_music}<span class="chip">music separated{win.music ? `, bed ${win.music.level_db ?? "off"} dB` : ""}</span>
+      {:else}<span class="chip" title="Tuned without music separation: the speech denoiser turned any music down with the noise">music removed</span>{/if}
+      <span class="spacer"></span>
+      <button disabled={!source?.exists} onclick={() => (cleaningAgain = true)}
+              title="Clean {formatClock(win.start_sec, false)}–{formatClock(win.end_sec, false)} once more, choosing the settings afresh (keep or remove the music, autotune or your own settings)">
+        Clean this stretch again…</button>
     </div>
+    {#if cleaningAgain && source}
+      <Modal title="Clean {formatClock(win.start_sec, false)}–{formatClock(win.end_sec, false)} again" onclose={() => (cleaningAgain = false)}>
+        <NewRun params={{ source: source.id, start: String(win.start_sec), duration: String(win.end_sec - win.start_sec), kind: plan.source_kind }}
+                onqueued={() => {
+                  cleaningAgain = false;
+                  toast(onqueued ? "Cleaning started. The clip switches to the new version when it is ready."
+                                 : "Cleaning started. The new version and its candidates appear on the video's strip when it is done.");
+                  onqueued?.();
+                }} />
+      </Modal>
+    {/if}
 
     <div class="layout">
      <div class="col left">
@@ -284,6 +346,9 @@
           </tbody>
         </table>
       </div>
+      {#if (selected ?? pickedIndex) >= 0}
+        <CandidateSettings planPath={plan.path} window={win.label} index={selected ?? pickedIndex} />
+      {/if}
      </div>
 
       <aside class="col">
@@ -327,8 +392,21 @@
               <div class="status col">
                 <span class="ok">Already rendered</span>
                 {#each made as o (o.file)}
-                  <div class="row"><a class="mono ellipsis" href={links.output(o.file)} title={o.file}>{ltr(o.file)}</a>
-                    <span class="spacer"></span><a href={links.output(o.file)}><button class="small primary">Compare</button></a></div>
+                  {#if renaming === o.file}
+                    <div class="row">
+                      <input class="grow" bind:value={newTag} placeholder="label (empty = no label)" title="The label in the file name"
+                             onkeydown={(e) => { if (e.key === "Enter") saveName(o); if (e.key === "Escape") { e.stopPropagation(); renaming = null; } }} />
+                      <button class="small primary" onclick={() => saveName(o)}>Save</button>
+                      <button class="small" onclick={() => (renaming = null)}>Cancel</button>
+                    </div>
+                  {:else}
+                    <div class="row"><span class="chip">{versionName(o)}</span>
+                      <a class="mono ellipsis" href={links.output(o.file)} title={o.file}>{ltr(o.file)}</a>
+                      <span class="spacer"></span>
+                      <button class="link small" onclick={() => { renaming = o.file; newTag = o.tag ?? ""; }} title="Change its label (the file and the clips using it follow)">Rename</button>
+                      <button class="link small danger" onclick={() => deleteVersion(o)} title="Delete this rendered version (moves to _trash); clips using it go back to their original sound">Delete</button>
+                      <a href={links.output(o.file)}><button class="small primary">Compare</button></a></div>
+                  {/if}
                 {/each}
                 <div><button class="link small" onclick={() => (again = true)}>Render it again anyway…</button></div>
               </div>
@@ -357,7 +435,10 @@
           <div>Qualify: fidelity within {plan.criteria.fidelity_tolerance} of the gentlest, warble at most
             {plan.criteria.max_warble_increase} above the calmest of those. Score = hiss removed + {plan.criteria.click_weight} × ticks removed.</div>
           <div>Candidates are heard as measured (before loudness normalisation); level-match evens them out.</div>
-          {#if files}<div><button class="small danger" onclick={deleteAudio}>Delete candidate audio</button></div>{/if}
+          <div class="row wrap">
+            {#if files}<button class="small danger" onclick={deleteAudio} title="Free the disk space; the measurements stay">Delete candidate audio</button>{/if}
+            <button class="small danger" onclick={deleteTuning} title="Remove this tuning run (its blue bar) altogether; rendered versions stay">Delete this tuning run…</button>
+          </div>
         </div>
       </aside>
     </div>

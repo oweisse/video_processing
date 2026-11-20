@@ -108,8 +108,11 @@ def use_cached_model_offline():
 
 def separate_to_files(input_wav, vocals_path, music_path, target_sr,
                       duration_sec=None, device="auto", segment=None,
-                      prefix="Separating"):
+                      prefix="Separating", gate_music=False):
     """Split input into a speech stem and a music bed, both at target_sr.
+
+    With gate_music the bed keeps only its music: the ambience and noise Demucs also
+    puts there are turned down where no music plays (musicgate.py).
 
     Returns (vocals_path, music_path).
     """
@@ -167,6 +170,11 @@ def separate_to_files(input_wav, vocals_path, music_path, target_sr,
         vocals = torchaudio.functional.resample(vocals, model_sr, target_sr)
         music = torchaudio.functional.resample(music, model_sr, target_sr)
 
+    if gate_music:
+        from . import musicgate
+        music, info = musicgate.gate(music, target_sr)
+        print_info(f"Music bed: music in {info['music_fraction']:.0%} of the stretch; the rest "
+                   f"(ambience, noise) turned down {info['range_db']:g} dB.")
     write_wav(vocals_path, vocals, target_sr)
     write_wav(music_path, music, target_sr)
     return vocals_path, music_path

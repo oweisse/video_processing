@@ -52,6 +52,11 @@ where only one of each exists yet.
 
 ### 0.4 Implementation progress and deviations
 
+**Inserted before phases C–H:** `docs/stitch-and-size-budget-plan.md` (stitching several
+cleaned videos into one timeline, soft sound between clips, lossless joining, export to
+a size budget, a first real Deliver page). It wins over this document where they
+overlap; its §13 lists what phases C, G and H here must carry over.
+
 Where the implementation differs from the text below, this list wins.
 
 **Phase A (shell, look, Media)** — done.

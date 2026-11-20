@@ -81,7 +81,14 @@ def summary(output_dir, project_path):
     return {"name": project.get("name") or Path(project_path).parent.name,
             "path": str(project_path), "modified": project.get("modified"),
             "duration_sec": dur, "clips": n, "export_path": str(out),
-            "exported": out.exists()}
+            "exported": out.exists(), "videos": video_ids(project)}
+
+
+def video_ids(project):
+    """The project's videos (source ids) in the order its Videos panel shows them."""
+    ids = list((project.get("sources") or {}).keys())
+    order = [i for i in project.get("video_order") or [] if i in ids]
+    return order + [i for i in ids if i not in order]
 
 
 def list_projects(output_dir):

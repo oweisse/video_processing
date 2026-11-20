@@ -15,6 +15,9 @@ export const store = $state({
   connected: false,
   error: null as string | null,
   toasts: [] as { id: number; text: string; level: "info" | "error"; action?: ToastAction }[],
+  // The project Media is showing, if any: videos added there (or dropped on the window
+  // meanwhile) go into it too.
+  mediaProject: null as string | null,
 });
 
 let toastId = 0;
@@ -110,6 +113,50 @@ export function sourceById(id: string | undefined) {
 
 export function activeJobs() {
   return store.jobs.filter((j) => j.state === "running" || j.state === "queued");
+}
+
+/** Queue preparing (editing copy, thumbnails, waveform) for the videos not prepared or
+ *  being prepared yet; returns how many were queued. */
+export async function prepareVideos(sources: Source[]): Promise<number> {
+  const busy = new Set(
+    store.jobs.filter((j) => j.type === "prep" && (j.state === "queued" || j.state === "running")).map((j) => j.meta?.source_id),
+  );
+  const todo = sources.filter((s) => s.exists && !(s.prep?.proxy && s.prep?.thumbs) && !busy.has(s.id));
+  for (const s of todo) {
+    try {
+      await api.submit({ type: "prep", source_id: s.id });
+    } catch (e) {
+      reportError(e);
+    }
+  }
+  if (todo.length) toast(`Preparing ${todo.length} video${todo.length === 1 ? "" : "s"} for editing, one after another`, "info",
+    { label: "Show queue", run: () => (shell.jobsOpen = true) });
+  return todo.length;
+}
+
+/** Several files from the native dialog: undefined in a plain browser, [] when cancelled. */
+export async function nativePickMany(kind: "file" | "audio", start?: string): Promise<string[] | undefined> {
+  if (!store.native) return undefined;
+  try {
+    return (await api.pick(kind, start, true)).paths;
+  } catch (e) {
+    reportError(e);
+    return [];
+  }
+}
+
+/** Add videos (files and/or a folder's videos) to the library folder; returns the added ids. */
+export async function addVideos(sel: { paths?: string[]; folder?: string }): Promise<string[]> {
+  try {
+    const r = await api.addSources(sel);
+    await loadLibrary();
+    const n = r.added.length;
+    toast(`Added ${n} video${n === 1 ? "" : "s"}` + (r.missing.length ? ` (${r.missing.length} not found)` : ""));
+    return r.added.map((s) => s.id);
+  } catch (e) {
+    reportError(e);
+    return [];
+  }
 }
 
 /**

@@ -10,13 +10,20 @@
     title,
     onpick,
     onclose,
+    onpickmany,
   }: {
     mode: "dir" | "file";
     start?: string;
     title: string;
     onpick: (path: string) => void;
     onclose: () => void;
+    /** Files mode: tick several files, or take every video of the folder shown. */
+    onpickmany?: (sel: { paths?: string[]; folder?: string }) => void;
   } = $props();
+  let ticked = $state<string[]>([]);
+  function tick(path: string) {
+    ticked = ticked.includes(path) ? ticked.filter((p) => p !== path) : [...ticked, path];
+  }
 
   let listing = $state<FsList | null>(null);
   let error = $state<string | null>(null);
@@ -57,14 +64,22 @@
           📁 {ltr(e.name)}
         </button>
       {:else}
-        <button class="entry" onclick={() => onpick(e.path)}>
-          🎞 {ltr(e.name)} <span class="faint">{formatBytes(e.size)}</span>
+        <button class="entry" class:ticked={ticked.includes(e.path)} onclick={() => (onpickmany ? tick(e.path) : onpick(e.path))}>
+          {onpickmany ? (ticked.includes(e.path) ? "☑" : "☐") : ""} 🎞 {ltr(e.name)} <span class="faint">{formatBytes(e.size)}</span>
         </button>
       {/if}
     {:else}
       <div class="faint pad">{mode === "file" ? "No folders or videos here." : "No sub-folders."}</div>
     {/each}
   </div>
+  {#if mode === "file" && onpickmany}
+    <div class="row">
+      <span class="faint ellipsis">{ticked.length ? `${ticked.length} chosen` : "Click videos to choose them"}</span>
+      <span class="spacer"></span>
+      <button disabled={!listing} onclick={() => listing && onpickmany({ folder: listing.dir })}>Add every video in this folder</button>
+      <button class="primary" disabled={!ticked.length} onclick={() => onpickmany({ paths: ticked })}>Add {ticked.length || ""}</button>
+    </div>
+  {/if}
   {#if mode === "dir"}
     <div class="row">
       <span class="faint ellipsis">{listing?.dir}</span>
@@ -87,5 +102,6 @@
     background: none; padding: 5px 10px; border-bottom: 1px solid var(--border);
   }
   .entry:hover { background: var(--bg-hover); }
+  .entry.ticked { background: var(--bg-hover); }
   .pad { padding: 10px; }
 </style>

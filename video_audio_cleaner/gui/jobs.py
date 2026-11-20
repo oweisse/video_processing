@@ -1,7 +1,9 @@
 """Job queue: every long operation is a CLI subprocess with a JSON event stream.
 
 One ML job runs at a time (Demucs and DeepFilterNet each want most of a 16 GB
-machine); light jobs (ffmpeg-only) get a lane of their own. Jobs are persisted
+machine); light jobs (ffmpeg-only) get a lane of their own. A job starts only when its
+estimated memory (meta.memory_gb) fits in the server's budget (memory.py), and the
+watchdog stops jobs if the server still goes over it. Jobs are persisted
 as OUTPUT_DIR/_gui/jobs/<id>.json with their log beside them, so history
 survives restarts.
 """
@@ -14,8 +16,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .. import memory
+
 # Heavy jobs share one lane; preparing sources (ffmpeg, light) runs beside them.
-ML_TYPES = {"clean", "clean_candidate", "tune", "export"}
+ML_TYPES = {"clean", "clean_candidate", "tune", "export", "export_estimate"}
 MAX_MESSAGES = 40
 CANCEL_LADDER = ((signal.SIGINT, 5.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0))
 ACTIVE = ("queued", "running")
@@ -41,11 +45,45 @@ class JobQueue:
         self._lanes = {"ml": asyncio.Queue(), "light": asyncio.Queue()}
         self._procs = {}
         self._workers = []
+        # Called first when the server goes over its memory budget: stops cheap work
+        # (preview ffmpeg runs) that is simply redone later. Returns how much it stopped.
+        self.cheap_stoppers = []
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
         for lane in self._lanes:
             self._workers.append(asyncio.create_task(self._worker(lane)))
+        self._workers.append(asyncio.create_task(self._watchdog()))
+
+    async def _watchdog(self, period=1.0):
+        """Keep the server and everything it started within the memory budget: over it,
+        stop preview ffmpeg runs first, then the light job, then the heavy one."""
+        while True:
+            await asyncio.sleep(period)
+            budget = memory.budget_bytes()
+            memory.forget_usage()
+            used = memory.our_usage()
+            if not budget or used is None or used <= budget:
+                continue
+            stopped = 0
+            for stop in self.cheap_stoppers:
+                try:
+                    stopped += stop() or 0
+                except Exception:   # noqa: BLE001
+                    pass
+            if stopped:
+                continue        # measure again before stopping a job
+            running = [self.jobs[i] for i in self._procs if i in self.jobs]
+            if not running:
+                continue
+            # the light lane first (it is redone cheaply), then the heaviest
+            running.sort(key=lambda j: (j["type"] in ML_TYPES, float((j.get("meta") or {}).get("memory_gb") or 0)))
+            victim = running[0]
+            victim["memory_stopped"] = (f"Stopped: the editor reached its memory budget "
+                                        f"({used / memory.GB:.1f} of {budget / memory.GB:.3g} GB). "
+                                        f"Try a shorter stretch, or run it when nothing else is.")
+            asyncio.create_task(self.cancel(victim["id"]))
+            await asyncio.sleep(period * 3)   # let it go before measuring again
 
     async def stop(self):
         for job_id in list(self._procs):
@@ -198,6 +236,23 @@ class JobQueue:
             job = self.jobs.get(job_id)
             if job is None or job["state"] != "queued":
                 continue
+            # Never start work that would take the machine past its memory limit.
+            need = float((job.get("meta") or {}).get("memory_gb") or 0.0)
+            if memory.never_fits(need):
+                job["error"] = (f"This needs about {need:.0f} GB of memory, more than the editor's budget of "
+                                f"{memory.budget_bytes() / memory.GB:.3g} GB. Clean it in shorter stretches.")
+                self._finish(job, "failed", None)
+                continue
+            if not memory.room_for(need):
+                job["step"] = {"index": None, "total": None,
+                               "title": f"Waiting for memory to free up (needs about {need:.0f} GB)"}
+                self._publish(job)
+                while not memory.room_for(need) and job["state"] == "queued":
+                    await asyncio.sleep(2.0)
+                    memory.forget_usage()
+                job["step"] = None
+                if job["state"] != "queued":
+                    continue
             try:
                 await self._run(job)
             except Exception as exc:   # noqa: BLE001
@@ -265,7 +320,10 @@ class JobQueue:
                 rc = await proc.wait()
             finally:
                 self._procs.pop(job["id"], None)
-        if job.get("cancel_requested"):
+        if job.get("memory_stopped"):
+            state = "failed"
+            job["error"] = job.pop("memory_stopped")
+        elif job.get("cancel_requested"):
             state = "cancelled"
         elif rc == 0:
             state = "done"

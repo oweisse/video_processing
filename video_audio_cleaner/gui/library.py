@@ -17,6 +17,7 @@ from ..events import clean as json_safe
 from ..timeparse import format_time_filename
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".wav"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".mts", ".m2ts"}
 _WINDOW = re.compile(r"((?:\d+h)?\d+m\d+s)-((?:\d+h)?\d+m\d+s|end)", re.I)
 
 
@@ -199,8 +200,11 @@ def _probe_cache(output_dir, source_id):
 
 
 def cached_probe(output_dir, source):
+    """The cached probe, unless it is missing or older than the probe's current version."""
     data = _load_json(_probe_cache(output_dir, source["id"]))
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or (data.get("probe_version") or 1) < probe_mod.PROBE_VERSION:
+        return None
+    return data
 
 
 def probe_source(output_dir, source):
@@ -235,18 +239,33 @@ class Library:
         return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
 
     def add_source(self, path):
-        path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.isfile(path):
-            raise FileNotFoundError(path)
+        return self.add_sources([path])["added"][0]
+
+    def add_sources(self, paths=(), folder=None):
+        """Add videos as sources: files, and/or every video directly inside a folder.
+        Returns {"added": [sources], "missing": [paths]}; raises FileNotFoundError when
+        none of them exists."""
+        paths = [os.path.abspath(os.path.expanduser(p)) for p in paths]
+        if folder:
+            folder = os.path.abspath(os.path.expanduser(folder))
+            if not os.path.isdir(folder):
+                raise FileNotFoundError(folder)
+            paths += sorted(str(p) for p in Path(folder).iterdir()
+                            if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+                            and not p.name.startswith(".") and ".partial" not in p.name)
+        found = [p for p in dict.fromkeys(paths) if os.path.isfile(p)]
+        missing = [p for p in paths if not os.path.isfile(p)]
+        if not found:
+            raise FileNotFoundError(missing[0] if missing else (folder or ""))
         extra = self.extra_sources()
-        if path not in extra:
-            extra.append(path)
+        new = [p for p in found if p not in extra]
+        if new:
             self.gui_dir.mkdir(parents=True, exist_ok=True)
-            self._extra_sources_path().write_text(json.dumps(extra, indent=2,
+            self._extra_sources_path().write_text(json.dumps(extra + new, indent=2,
                                                              ensure_ascii=False),
                                                   encoding="utf-8")
         self.rescan()
-        return self.source_by_path(path)
+        return {"added": [self.source_by_path(p) for p in found], "missing": missing}
 
     def get(self):
         with self._lock:

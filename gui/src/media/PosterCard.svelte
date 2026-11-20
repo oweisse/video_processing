@@ -5,10 +5,11 @@
   import { formatDuration } from "../lib/time";
   import { coverage } from "./coverage";
 
-  let { source: s, selected = false, onselect, onopen }: {
+  let { source: s, selected = false, onselect, onopen, ondragstart }: {
     source: Source;
     selected?: boolean;
-    onselect: () => void;
+    onselect: (ev: MouseEvent) => void;
+    ondragstart?: (ev: DragEvent) => void; // drag the video (onto a project)
     onopen: () => void;
   } = $props();
 
@@ -31,6 +32,7 @@
     }
   }
   function move(ev: PointerEvent) {
+    if (ev.buttons) return; // a press may become a drag (onto a project): keep the picture still
     const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
     hover = Math.max(0, Math.min(SCRUB - 1, Math.floor(((ev.clientX - r.left) / r.width) * SCRUB)));
     load();
@@ -42,10 +44,11 @@
   const v = $derived(s.probe?.video);
 </script>
 
-<button class="card-btn" class:selected onclick={onselect} ondblclick={onopen} title={s.path}>
+<button class="card-btn" class:selected onclick={onselect} ondblclick={onopen} title={s.path}
+        draggable={!!ondragstart} {ondragstart}>
   <div class="poster" onpointermove={move} onpointerleave={() => (hover = null)} role="presentation">
     {#if hasPicture && !failed}
-      <img src={shown} alt="" loading="lazy" onerror={() => (failed = true)} />
+      <img src={shown} alt="" loading="lazy" draggable="false" onerror={() => (failed = true)} />
     {:else}
       <span class="faint">{s.exists ? (s.probe ? "no picture" : "…") : "file missing"}</span>
     {/if}

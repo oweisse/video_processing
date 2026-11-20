@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Shown instead of any workspace until a project folder is open.
+  // Shown instead of any workspace until a library folder is open.
   import { api } from "../lib/api";
   import { nativePick, reportError, store } from "../lib/state.svelte";
   import FolderBrowser from "./FolderBrowser.svelte";
@@ -26,9 +26,9 @@
 
 <div class="wrap">
   <div class="card col chooser">
-    <h1>Open a project folder</h1>
-    <p class="dim">A project is an output folder: every cleaned video there, with the sources it came from,
-      its tuning and its timelines, is shown here. Pick the folder you pass to <code>--output_dir</code>{store.native ? ", or drop it onto this window" : ""}.</p>
+    <h1>Open a library folder</h1>
+    <p class="dim">The library folder is where cleaned videos are written: every cleaned video there, with
+      the videos it came from, its tuning and your projects, is shown here. Pick the folder you pass to <code>--output_dir</code>{store.native ? ", or drop it onto this window" : ""}.</p>
     {#each store.library?.recent_output_dirs ?? [] as dir}
       <button class="recent" onclick={() => open(dir)}>{dir}</button>
     {/each}
@@ -41,7 +41,7 @@
 </div>
 
 {#if browsing}
-  <FolderBrowser mode="dir" title="Open a project folder" onpick={open} onclose={() => (browsing = false)} />
+  <FolderBrowser mode="dir" title="Open a library folder" onpick={open} onclose={() => (browsing = false)} />
 {/if}
 
 <style>

@@ -7,14 +7,24 @@
   import { formatDuration, parseTime } from "../lib/time";
   import FolderBrowser from "../components/FolderBrowser.svelte";
   import SourceStrip from "../components/SourceStrip.svelte";
+  import type { BatchRow } from "../edit/cleanclips";
 
-  let { params }: { params: Record<string, string> } = $props();
+  // onqueued: called once the runs are queued (the form inside the editor closes then),
+  // with the batch rows queued; without it the job queue opens.
+  // batch: stretches of several videos to clean with one set of settings (the editor's
+  // "Clean clips…"); the source and window fields give way to a list of them.
+  let { params, onqueued, batch }: {
+    params: Record<string, string>;
+    onqueued?: (rows: BatchRow[]) => void;
+    batch?: BatchRow[];
+  } = $props();
 
   // svelte-ignore state_referenced_locally
   const initial = params;
   let sourceId = $state(initial.source ?? "");
   let kind = $state<SourceKind | "">((initial.kind as SourceKind) || "");
-  let music = $state(!!initial.music);
+  // Background music stays unless asked to go (then the speech denoiser takes it out).
+  let removeMusic = $state(initial.music === "remove");
   let autotune = $state(true);
   let tag = $state(initial.tag ?? "");
   let rows = $state([{ start: initial.start ? String(initial.start) : "", duration: initial.duration ? String(initial.duration) : "" }]);
@@ -23,6 +33,13 @@
   let schema = $state<CliOption[]>([]);
   let browsing = $state(false);
   let submitting = $state(false);
+  // svelte-ignore state_referenced_locally
+  let picked = $state((batch ?? []).map(() => true));
+  // svelte-ignore state_referenced_locally
+  if (batch?.length && !kind) {
+    const kinds = new Set(batch.map((b) => sourceById(b.source)?.source_kind).filter((k) => !!k));
+    if (kinds.size === 1) kind = [...kinds][0]!;
+  }
 
   const source = $derived(sourceById(sourceId));
   const sources = $derived((store.library?.sources ?? []).filter((s) => s.exists));
@@ -39,7 +56,7 @@
   api.cliSchema().then((s) => (schema = s)).catch(reportError);
 
   // ---------------------------------------------------------------- parsing
-  type Parsed = { start: number; duration: number | null; error: string | null };
+  type Parsed = { start: number; duration: number | null; error: string | null; source?: string };
   function parseRow(r: { start: string; duration: string }): Parsed {
     try {
       const start = parseTime(r.start) ?? 0;
@@ -51,12 +68,16 @@
       return { start: 0, duration: null, error: (e as Error).message };
     }
   }
-  const parsed = $derived(rows.map(parseRow));
+  const parsed = $derived<Parsed[]>(
+    batch
+      ? batch.filter((_, i) => picked[i]).map((b) => ({ start: b.start, duration: b.duration, error: null, source: b.source }))
+      : rows.map(parseRow),
+  );
 
   function request(p: Parsed) {
     return {
-      type: "clean", source_id: sourceId, start_sec: p.start, duration_sec: p.duration,
-      autotune, source_kind: kind || null, separate_music: music, tag: tag.trim() || null,
+      type: "clean", source_id: p.source ?? sourceId, start_sec: p.start, duration_sec: p.duration,
+      autotune, source_kind: kind || null, remove_music: removeMusic, tag: tag.trim() || null,
       overrides: $state.snapshot(overrides),
     };
   }
@@ -69,7 +90,7 @@
   $effect(() => {
     const reqs = parsed.map((p) => ({ p, req: request(p) }));
     clearTimeout(timer);
-    if (!sourceId) {
+    if (!sourceId && !batch) {
       command = null;
       names = [];
       return;
@@ -79,6 +100,9 @@
       if (autotune && !kind) {
         command = null;
         commandError = null; // the form says what is missing
+      } else if (!first) {
+        command = null;
+        commandError = null;
       } else if (first.p.error) {
         commandError = first.p.error;
         command = null;
@@ -94,6 +118,7 @@
       names = await Promise.all(
         reqs.map(({ p }) =>
           p.error ? Promise.resolve({ name: "", exists: false })
+            : batch ? Promise.resolve({ name: "", exists: false })
             : api.previewName(sourceId, p.start, p.duration, tag.trim() || null).catch(() => ({ name: "", exists: false })),
         ),
       );
@@ -104,13 +129,13 @@
   // Demucs adds about 0.5 s/s.
   const estimate = $derived(
     parsed.reduce((sum, p) => {
-      const len = p.duration ?? (fileDuration !== null ? fileDuration - p.start : 0);
-      return sum + len * ((autotune ? 0.8 : 0) + 0.35 + (music ? 0.5 : 0));
+      const len = p.duration ?? (p.source ? 0 : fileDuration !== null ? fileDuration - p.start : 0);
+      return sum + len * ((autotune ? 0.8 : 0) + 0.35 + (removeMusic ? 0 : 0.5));
     }, 0),
   );
 
   const ready = $derived(
-    !!sourceId && (!autotune || !!kind) && parsed.every((p) => !p.error) && !commandError && !submitting,
+    (!!sourceId || (!!batch && parsed.length > 0)) && (!autotune || !!kind) && parsed.every((p) => !p.error) && !commandError && !submitting,
   );
 
   async function submit(stay: boolean) {
@@ -118,9 +143,11 @@
     try {
       for (const p of parsed) {
         const job = await api.submit(request(p));
-        queued(job);
+        if (!batch) queued(job);
       }
+      if (batch) toast(`Queued ${parsed.length} clean${parsed.length === 1 ? "" : "s"}`, "info", { label: "Show queue", run: () => (shell.jobsOpen = true) });
       if (stay) rows = [{ start: "", duration: "" }];
+      else if (onqueued) onqueued(batch ? batch.filter((_, i) => picked[i]) : []);
       else shell.jobsOpen = true;
     } catch (e) {
       reportError(e);
@@ -166,11 +193,24 @@
 </script>
 
 <div class="page col narrow">
-  <h1>New run</h1>
+  {#if !onqueued}<h1>New run</h1>{/if}
   {#if !store.library?.output_dir}
-    <div class="error-box">Open a project folder first (Library).</div>
+    <div class="error-box">Open a library folder first (Media).</div>
   {:else}
     <div class="card col">
+      {#if batch}
+        <div class="field">
+          <span>Stretches to clean <span class="faint">(each clip with a little sound to spare; nearby clips of a video together)</span></span>
+          {#each batch as b, i}
+            <label class="row small">
+              <input type="checkbox" bind:checked={picked[i]} />
+              <span class="ellipsis grow">{ltr(sourceById(b.source)?.name ?? b.source)}</span>
+              <span class="mono faint">{formatDuration(b.start)}–{formatDuration(b.start + b.duration)}</span>
+              {#if b.note}<span class="faint">{b.note}</span>{/if}
+            </label>
+          {/each}
+        </div>
+      {:else}
       <label class="field">
         <span>Source video</span>
         <div class="row">
@@ -202,9 +242,10 @@
         {/each}
         <div><button class="small" onclick={() => rows.push({ start: "", duration: "" })}>+ Add window</button></div>
       </div>
+      {/if}
 
       <div class="field">
-        <span>What did it come from?</span>
+        <span>What did {batch ? "these videos" : "it"} come from?</span>
         <div class="row">
           <label class="row"><input type="radio" bind:group={kind} value="tape" /> Tape <span class="faint small">(VHS, Super-8, other tape transfers: tunes hiss and tick removal)</span></label>
         </div>
@@ -213,8 +254,10 @@
         </div>
       </div>
 
-      <label class="row"><input type="checkbox" bind:checked={music} /> Background music
-        <span class="faint small">separate it with Demucs; autotune chooses how loud the music bed stays</span></label>
+      <label class="row"><input type="checkbox" bind:checked={removeMusic} /> Remove background music
+        <span class="faint small">{removeMusic
+          ? "music is treated as noise and taken out with it"
+          : "off: the music stays as it is; only the voices are cleaned (they are separated from the music with Demucs first)"}</span></label>
       <label class="row"><input type="checkbox" bind:checked={autotune} /> Autotune
         <span class="faint small">try the settings grid on this window and use the best; every candidate is kept for listening</span></label>
       <label class="field">
@@ -258,14 +301,14 @@
       <div class="row"><h3>Command</h3><span class="spacer"></span>
         {#if estimate > 0}<span class="dim small">about {formatDuration(estimate)} of work</span>{/if}</div>
       {#if commandError}<div class="danger small">{commandError}</div>
-      {:else if command}<code class="cmd">{command}</code>{#if rows.length > 1}<span class="faint small">…and {rows.length - 1} more like it</span>{/if}
-      {:else}<span class="faint small">Choose a source.</span>{/if}
+      {:else if command}<code class="cmd">{command}</code>{#if parsed.length > 1}<span class="faint small">…and {parsed.length - 1} more like it</span>{/if}
+      {:else if batch ? !parsed.length : !sourceId}<span class="faint small">{batch ? "Choose at least one stretch." : "Choose a source."}</span>{/if}
       {#if autotune && !kind}<div class="warn small">Choose tape or digital: autotune tunes differently for each.</div>{/if}
       <div class="row">
         <span class="spacer"></span>
-        <button disabled={!ready} onclick={() => submit(true)}>Queue and add another</button>
+        {#if !batch}<button disabled={!ready} onclick={() => submit(true)}>Queue and add another</button>{/if}
         <button class="primary" disabled={!ready} onclick={() => submit(false)}>
-          Queue {rows.length > 1 ? `${rows.length} runs` : "run"}
+          Queue {parsed.length > 1 ? `${parsed.length} runs` : "run"}
         </button>
       </div>
     </div>

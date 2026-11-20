@@ -4,12 +4,13 @@
   import { onMount } from "svelte";
   import { ltr } from "./lib/bidi";
   import { links, route, shell, WORKSPACES, type Workspace } from "./lib/router.svelte";
-  import { activeJobs, connectEvents, loadJobs, loadLibrary, nativePick, reportError, store, toast } from "./lib/state.svelte";
+  import { activeJobs, addVideos, connectEvents, loadJobs, loadLibrary, nativePick, reportError, store, toast } from "./lib/state.svelte";
   import { api } from "./lib/api";
   import FolderBrowser from "./components/FolderBrowser.svelte";
   import Icon, { type IconName } from "./components/Icon.svelte";
   import JobsDrawer from "./components/JobsDrawer.svelte";
   import ProjectChooser from "./components/ProjectChooser.svelte";
+  import { addToProject, VIDEO_DRAG } from "./media/projects";
   import Media from "./workspaces/Media.svelte";
   import Enhance from "./workspaces/Enhance.svelte";
   import Edit from "./workspaces/Edit.svelte";
@@ -23,7 +24,22 @@
     void loadLibrary();
     void loadJobs();
     connectEvents();
+    // the editor's memory, live, in the corner
+    const poll = () => api.memory().then((m) => (mem = m)).catch(() => (mem = null));
+    poll();
+    const timer = setInterval(() => { if (!document.hidden) poll(); }, 2000);
+    return () => clearInterval(timer);
   });
+
+  let mem = $state<{ used: number | null; budget: number | null; total: number | null; machine_used: number | null } | null>(null);
+  const GB = 2 ** 30;
+  const memText = $derived(mem?.used != null ? `${(mem.used / GB).toFixed(1)}${mem.budget ? ` / ${Math.round(mem.budget / GB)}` : ""} GB` : "");
+  const memHigh = $derived(!!mem?.used && !!mem?.budget && mem.used > mem.budget * 0.85);
+  const memTitle = $derived(mem?.used != null
+    ? `Memory the editor uses now (the server, its jobs and their ffmpeg runs)` +
+      (mem.budget ? `, against its budget of ${Math.round(mem.budget / GB)} GB: work waits or is stopped to stay under it` : "") +
+      (mem.machine_used != null && mem.total ? `.\nThe whole Mac: ${Math.round(mem.machine_used * 100)} % of ${Math.round(mem.total / GB)} GB in use.` : ".")
+    : "");
 
   const ICONS: Record<Workspace, IconName> = { media: "images", enhance: "wand-sparkles", edit: "film", deliver: "send" };
 
@@ -62,31 +78,39 @@
     }
   }
 
-  // Dropping a video adds it and opens a new clean on it; dropping a folder opens it as the
-  // project. Real paths only exist in the app window (pywebview adds pywebviewFullPath).
+  // Dropping videos adds them all (and shows them in Media); dropping a folder opens it as
+  // the library folder. Real paths only exist in the app window (pywebview adds pywebviewFullPath).
+  // Drags inside the app (videos onto a project) are not file drops.
+  const internal = (ev: DragEvent) => !!ev.dataTransfer?.types.includes(VIDEO_DRAG);
   function dragover(ev: DragEvent) {
-    if (ev.dataTransfer?.types.includes("Files")) ev.preventDefault();
+    if (ev.dataTransfer?.types.includes("Files") && !internal(ev)) ev.preventDefault();
   }
   async function drop(ev: DragEvent) {
-    const file = ev.dataTransfer?.files?.[0] as (File & { pywebviewFullPath?: string }) | undefined;
-    if (!file) return;
+    if (internal(ev)) return;
+    const files = [...(ev.dataTransfer?.files ?? [])] as (File & { pywebviewFullPath?: string })[];
+    if (!files.length) return;
     ev.preventDefault();
-    const path = file.pywebviewFullPath;
-    if (!path) {
-      toast("Dropping files works in the app window; here, use Add video… or Browse…", "error");
+    const paths = files.map((f) => f.pywebviewFullPath).filter((p): p is string => !!p);
+    if (!paths.length) {
+      toast("Dropping files works in the app window; here, use Add videos… in Media.", "error");
       return;
     }
+    const videos = paths.filter((p) => /\.(mp4|mov|m4v|mkv|avi|mts|m2ts|wav)$/i.test(p));
     try {
-      if (/\.(mp4|mov|m4v|mkv|wav)$/i.test(path)) {
+      if (videos.length) {
         if (!store.library?.output_dir) {
-          toast("Open a project folder first, then drop the video again.", "error");
+          toast("Open a library folder first, then drop the videos again.", "error");
           return;
         }
-        const s = await api.addSource(path);
-        await loadLibrary();
-        location.hash = links.newRun({ source: s.id, kind: s.source_kind ?? "" });
+        const ids = await addVideos({ paths: videos });
+        // Dropped while Media shows a project: into that project too.
+        if (ids.length && store.mediaProject) {
+          const sources = ids.map((id) => store.library?.sources.find((x) => x.id === id)).filter((x) => !!x);
+          await addToProject(store.mediaProject, sources);
+        }
+        if (route.workspace !== "edit") location.hash = "#/media";
       } else {
-        await switchProject(path);
+        await switchProject(paths[0]);
       }
     } catch (e) {
       reportError(e);
@@ -111,14 +135,14 @@
 <div class="app">
   <header class="topbar">
     {#if store.library?.output_dir}
-      <button class="project" title="Switch project folder · {store.library.output_dir}" onclick={startSwitch}>
+      <button class="project" title="Switch library folder · {store.library.output_dir}" onclick={startSwitch}>
         <Icon name="folder-open" size={14} />
         <span class="ellipsis">{store.library.output_dir.split("/").pop()}</span>
         <Icon name="chevron-down" size={12} />
       </button>
     {/if}
     <span class="spacer"></span>
-    {#if timeline}<span class="timeline ellipsis" title="Timeline">{ltr(timeline)}</span>{/if}
+    {#if timeline}<span class="timeline ellipsis" title="Project">{ltr(timeline)}</span>{/if}
     <span class="spacer"></span>
     {#if !store.connected && !store.error}<span class="warn">reconnecting…</span>{/if}
   </header>
@@ -156,7 +180,8 @@
         </a>
       {/each}
     </div>
-    <span class="version faint">{store.version ? `v${store.version}` : ""}</span>
+    <span class="version faint">
+      {#if memText}<span class="mem mono" class:high={memHigh} title={memTitle}>{memText}</span> · {/if}{store.version ? `v${store.version}` : ""}</span>
   </nav>
 </div>
 
@@ -175,7 +200,7 @@
 </div>
 
 {#if switching}
-  <FolderBrowser mode="dir" title="Open a project folder" start={store.library?.output_dir ?? "~"}
+  <FolderBrowser mode="dir" title="Open a library folder" start={store.library?.output_dir ?? "~"}
                  onpick={switchProject} onclose={() => (switching = false)} />
 {/if}
 
@@ -211,6 +236,7 @@
   .page-btn:hover { text-decoration: none; color: var(--text); background: var(--bg-hover); }
   .page-btn.on { color: var(--text); background: var(--bg-hover); box-shadow: inset 0 -2px 0 var(--accent); }
   .version { justify-self: end; font-size: 11px; }
+  .mem.high { color: var(--warn, #e0a030); }
   .toasts {
     position: fixed; right: 12px; bottom: calc(var(--pagebar-h) + 12px); display: flex; flex-direction: column;
     gap: 8px; z-index: 100;

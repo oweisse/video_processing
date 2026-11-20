@@ -1,6 +1,7 @@
 """The GUI server (docs/gui-design.md §5): library, jobs, media and the API guard."""
 import json
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -102,6 +103,13 @@ def test_probe_is_cached(client, project):
     assert probe["video"]["width"] == 640 and probe["audio"]["channels"] == 2
     assert (project / "_gui" / "cache" / "probe" / f"{sid}.json").exists()
     assert client.get("/api/library", headers=H).json()["sources"][0]["probe"]["duration_sec"]
+    # A probe cached before the probe gained fields is probed again.
+    cache = project / "_gui" / "cache" / "probe" / f"{sid}.json"
+    old = json.loads(cache.read_text())
+    old.pop("probe_version")
+    cache.write_text(json.dumps(old))
+    assert client.post("/api/library/rescan", headers=H).json()["sources"][0]["probe"] is None
+    assert client.get(f"/api/sources/{sid}/probe", headers=H).json()["probe_version"] >= 2
 
 
 def test_no_project_open(tmp_path):
@@ -137,6 +145,16 @@ def test_original_and_output_audio_are_prepared(client, project):
         r = client.get("/media/audio", params={"kind": kind, "file": name})
         assert r.status_code == 200 and r.content[4:8] == b"ftyp", kind
     assert len(list((project / "_gui" / "cache" / "audio").glob("*.m4a"))) == 2
+    # A section of a long output, and the same stretch of the original, cut exactly.
+    for kind in ("output", "original_for"):
+        r = client.get("/media/audio", params={"kind": kind, "file": name, "start": 1, "duration": 2})
+        assert r.status_code == 200, kind
+        got = project / "_section.m4a"
+        got.write_bytes(r.content)
+        length = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                 "-of", "csv=p=0", str(got)], capture_output=True, text=True).stdout
+        assert abs(float(length) - 2.0) < 0.05, kind
+    assert len(list((project / "_gui" / "cache" / "audio").glob("outsec_*.m4a"))) == 1
 
 
 # ------------------------------------------------------------------ commands
@@ -168,7 +186,25 @@ def test_tune_command(fx, project):
     argv = commands.tune_argv(fx.video, project, [{"start_sec": 2, "end_sec": 6}], "digital",
                               True)
     assert argv[3:5] == [str(fx.video), "00m02s-00m06s"]
-    assert argv[argv.index("--out_dir") + 1] == str(project / "_tuning" / "fixture-with-music")
+    assert argv[argv.index("--out_dir") + 1] == str(project / "_tuning" / "fixture-with-music-gated")
+
+
+@pytest.mark.parametrize("remove, separated, level", [
+    (False, True, "--music_level_db=0"),     # the default: music kept at its own level
+    (True, False, None),                     # asked for: the denoiser takes it out
+])
+def test_background_music_stays_unless_removed(client, remove, separated, level):
+    sid = client.get("/api/library", headers=H).json()["sources"][0]["id"]
+    body = {"type": "clean", "source_id": sid, "start_sec": 1, "duration_sec": 3,
+            "autotune": True, "source_kind": "digital", "remove_music": remove}
+    argv = client.post("/api/jobs/preview", json=body, headers=H).json()["argv"]
+    assert ("--separate_music" in argv) == separated
+    assert (level in argv) if level else not any(a.startswith("--music_level_db") for a in argv)
+    tune = {"type": "tune", "source_id": sid, "source_kind": "digital", "remove_music": remove,
+            "windows": [{"start_sec": 1, "end_sec": 4}]}
+    argv = client.post("/api/jobs/preview", json=tune, headers=H).json()["argv"]
+    assert ("--separate_music" in argv) == separated
+    assert ("--music_levels=0" in argv) == (not remove)
 
 
 def test_schema_lists_options_but_not_reserved_ones():
@@ -284,6 +320,49 @@ def test_pick_a_candidate_and_delete_its_audio(client, project):
     assert r.json() == {"ok": True}
 
 
+def test_deleting_a_tuning_run_and_renaming_a_version(client, project):
+    plan = str(project / "_tuning" / "fixture" / "plan.json")
+    plans = lambda: client.get("/api/library", headers=H).json()["sources"][0]["plans"]
+    assert len(plans()) == 1
+    r = client.post("/api/plans/window/delete", headers=H, json={"plan_path": plan, "window": "00m02s-00m06s"})
+    assert r.json()["ok"]
+    assert plans() == [] and not (project / "_tuning" / "fixture").exists()      # last window: whole run
+    assert any((project / "_trash").iterdir())
+    r = client.post("/api/outputs/fixture_00m02s-00m06s_v2.mp4/rename", headers=H, json={"tag": "music kept"})
+    assert r.json()["file"] == "fixture_00m02s-00m06s_music kept.mp4"
+    tags = {o["tag"] for o in client.get("/api/library", headers=H).json()["sources"][0]["outputs"]}
+    assert tags == {None, "music kept"}
+    r = client.post("/api/outputs/fixture_00m02s-00m06s_music kept.mp4/rename", headers=H, json={"tag": ""})
+    assert r.status_code == 409                  # the untagged name is taken
+
+
+def test_storage_and_deleting_a_used_version(client, project):
+    sid = client.get("/api/library", headers=H).json()["sources"][0]["id"]
+    client.post("/api/projects", headers=H, json={"name": "Show"})
+    p = client.get("/api/projects/Show", headers=H).json()
+    out = project / "fixture_00m02s-00m06s_v2.mp4"
+    p["sources"][sid] = {"path": client.get("/api/library", headers=H).json()["sources"][0]["path"]}
+    p["tracks"]["video"] = [{"id": "c1", "source": sid, "in_sec": 2.5, "out_sec": 5,
+                             "audio": {"file": str(out), "output": out.name, "start_sec": 2.0}}]
+    assert client.put("/api/projects/Show", headers=H, json=p).status_code == 200
+
+    u = client.get("/api/storage?project=Show", headers=H).json()
+    row = u["videos"][0]
+    assert row["original"] > 0 and row["rendered"] >= 2 * out.stat().st_size and row["versions"] == 2
+    assert row["tuning"] > 0 and row["tunings"] == 1
+    assert u["totals"]["extra"] == row["editing"] + row["tuning"] + row["rendered"]
+
+    used = client.get(f"/api/outputs/{out.name}/used-by", headers=H).json()["used_by"]
+    assert used == [{"project": "Show", "clips": 1}]
+    r = client.post(f"/api/outputs/{out.name}/delete", headers=H).json()
+    assert r["projects"] == ["Show"]
+    assert client.get("/api/projects/Show", headers=H).json()["tracks"]["video"][0]["audio"] is None
+    after = client.get("/api/storage?project=Show", headers=H).json()
+    assert after["videos"][0]["rendered"] < row["rendered"] and after["trash"] > 0
+    assert client.post("/api/trash/empty", headers=H).json()["freed"] == after["trash"]
+    assert client.get("/api/storage", headers=H).json()["trash"] == 0
+
+
 def test_delete_moves_to_trash(client, project):
     r = client.post("/api/outputs/fixture_00m02s-00m06s_v2.mp4/delete", headers=H).json()
     assert len(r["moved"]) == 2
@@ -295,23 +374,26 @@ def test_delete_moves_to_trash(client, project):
 # ------------------------------------------------------------------ native window
 class FakeDialogs:
     def __init__(self, answer):
-        self.answer = answer
+        self.answer = answer        # the paths the user "chose"
         self.asked = []
 
-    def pick(self, kind, start=None):
-        self.asked.append((kind, start))
-        return self.answer
+    def pick(self, kind, start=None, multiple=False):
+        self.asked.append((kind, start, multiple))
+        return self.answer if multiple else self.answer[:1]
 
 
 def test_native_dialogs_only_in_the_window(project):
     with TestClient(create_app(project)) as c:
         assert c.get("/api/app", headers=H).json()["native"] is False
         assert c.get("/api/fs/pick", headers=H).status_code == 501
-    dialogs = FakeDialogs("/x/y.mp4")
+    dialogs = FakeDialogs(["/x/y.mp4", "/x/z.mp4"])
     with TestClient(create_app(project, dialogs=dialogs)) as c:
         assert c.get("/api/app", headers=H).json()["native"] is True
         r = c.get("/api/fs/pick", headers=H, params={"kind": "dir", "start": "/tmp"})
-        assert r.json() == {"path": "/x/y.mp4"} and dialogs.asked == [("dir", "/tmp")]
+        assert r.json() == {"path": "/x/y.mp4", "paths": ["/x/y.mp4"]}
+        r = c.get("/api/fs/pick", headers=H, params={"kind": "file", "multiple": True})
+        assert r.json()["paths"] == ["/x/y.mp4", "/x/z.mp4"]
+        assert dialogs.asked == [("dir", "/tmp", False), ("file", None, True)]
 
 
 def test_gui_parser_defaults_to_the_window():
@@ -342,6 +424,7 @@ def test_projects_round_trip(client, project, fx):
     assert client.put("/api/projects/Wedding cut", headers=H, json=bad).status_code == 400
     [summary] = client.get("/api/library", headers=H).json()["projects"]
     assert summary["name"] == "Wedding cut" and summary["duration_sec"] == 4.0
+    assert summary["videos"] == [sid]
     assert summary["export_path"] == str(project / "Wedding cut.mp4")
     song = project / "song.wav"
     shutil.copy(fx.music, song)
@@ -360,6 +443,13 @@ def test_export_plan_and_jobs(client, project, fx):
     client.put("/api/projects/cut", headers=H, json=p)
     plan = client.get("/api/projects/cut/plan", headers=H).json()
     assert plan["mode"] == "copy" and plan["output"].endswith("cut.mp4")
+    # An embedded probe from before probe version 2 is swapped for the library's.
+    old = dict(p["sources"][sid]["probe"])
+    old.pop("probe_version")
+    old["video"] = {k: v for k, v in old["video"].items() if k != "extradata_md5"}
+    p["sources"][sid]["probe"] = old
+    client.put("/api/projects/cut", headers=H, json=p)
+    assert client.get("/api/projects/cut/plan", headers=H).json()["mode"] == "copy"
     job = client.post("/api/jobs", headers=H, json={"type": "export", "project": "cut"}).json()
     assert job["argv"][2] == "video_audio_cleaner.export"
     assert wait_for(client, job["id"], timeout=60)["state"] == "done"
@@ -378,6 +468,22 @@ def test_prepare_a_source_for_editing(client, project):
     assert thumbs == {"interval": 2.0, "count": 30}
     assert client.get("/media/thumb", params={"source": sid, "i": 3}).content[:2] == b"\xff\xd8"
     assert client.get("/media/peaks", params={"source": sid}).content[:4] == b"VACP"
+
+
+def test_several_videos_are_added_at_once(client, project, fx, tmp_path):
+    folder = tmp_path / "tapes"
+    folder.mkdir()
+    for name in ("a.mp4", "b.MOV", "notes.txt", ".hidden.mp4"):
+        shutil.copy(fx.video, folder / name) if name != "notes.txt" else (folder / name).write_text("x")
+    one = tmp_path / "single.mp4"
+    shutil.copy(fx.video, one)
+    r = client.post("/api/sources/many", headers=H,
+                    json={"paths": [str(one), str(tmp_path / "gone.mp4")], "folder": str(folder)}).json()
+    assert [s["name"] for s in r["added"]] == ["single.mp4", "a.mp4", "b.MOV"]
+    assert r["missing"] == [str(tmp_path / "gone.mp4")]
+    names = {s["name"] for s in client.get("/api/library", headers=H).json()["sources"]}
+    assert {"single.mp4", "a.mp4", "b.MOV"} <= names
+    assert client.post("/api/sources/many", headers=H, json={"paths": [str(tmp_path / "x.mp4")]}).status_code == 404
 
 
 def test_exports_are_not_listed_as_stray_files(client, project):
@@ -410,3 +516,9 @@ def test_source_posters(client, project):
     assert (project / "_gui" / "cache" / "posters" / f"{sid}_12_11.jpg").exists()
     assert client.get("/media/poster", params={"source": sid, "i": 12, "n": 12}).status_code == 422
     assert client.get("/media/poster", params={"source": sid, "i": 0, "n": 7}).status_code == 422
+
+
+def test_a_projects_videos_follow_its_order():
+    from video_audio_cleaner.gui.projects import video_ids
+    p = {"sources": {"a": {}, "b": {}, "c": {}}, "video_order": ["c", "gone", "a"]}
+    assert video_ids(p) == ["c", "a", "b"]

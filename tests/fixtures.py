@@ -139,3 +139,47 @@ def build(root):
             "-pix_fmt", "yuv420p", "-preset", "ultrafast",
             "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-t", f"{DURATION:g}", str(video))
     return Fixture(root=root, video=video, **paths)
+
+
+# ------------------------------------------------------------------ more videos
+# Small extra videos for stitching tests (docs/stitch-and-size-budget-plan.md §3.4),
+# each a few seconds of work. They take their sound from the main set.
+
+def build_twin(root, fx):
+    """Same encoder settings as fx.video (size, rate, GOP, codec setup), other content:
+    two files that can be joined without re-encoding."""
+    out = Path(root) / "twin.mp4"
+    if not out.exists():
+        # The same pattern source as fx.video (another source changes the colour
+        # metadata, and with it the decoder setup); a hue turn makes the pictures differ.
+        _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x480:rate=24:duration=20",
+                "-i", str(fx.mix_music),
+                "-map", "0:v", "-map", "1:a", "-vf", "hue=h=150", "-c:v", "libx264", "-g", "48",
+                "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-t", "20", str(out))
+    return out
+
+
+def build_other(root, fx):
+    """A different format: 320×240, 25 fps, mono 44.1 kHz sound, 20 s."""
+    out = Path(root) / "other.mp4"
+    if not out.exists():
+        _ffmpeg("-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=20",
+                "-i", str(fx.clean_speech),
+                "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-g", "50",
+                "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-ar", "44100", "-t", "20", str(out))
+    return out
+
+
+def build_anamorphic(root, fx):
+    """Non-square pixels like a tape transfer: 360×288 stored, 16:15 pixels, 10 s."""
+    out = Path(root) / "anamorphic.mp4"
+    if not out.exists():
+        _ffmpeg("-f", "lavfi", "-i", "testsrc2=size=360x288:rate=25:duration=10",
+                "-i", str(fx.mix_noisy),
+                "-map", "0:v", "-map", "1:a", "-vf", "setsar=16/15", "-c:v", "libx264",
+                "-g", "50", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-t", "10", str(out))
+    return out
+

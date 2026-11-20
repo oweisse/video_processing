@@ -10,6 +10,8 @@ import subprocess
 import sys
 
 KEYFRAME_SAMPLE_SEC = 60
+# Bumped when the result gains fields; caches holding an older probe are probed again.
+PROBE_VERSION = 2
 
 
 def source_id(path):
@@ -34,6 +36,16 @@ def _rate(text):
         return round(value, 3) if value > 0 else None
     except (ValueError, ZeroDivisionError):
         return None
+
+
+def _sar(text):
+    """Sample (pixel) aspect ratio as a float; 1.0 when square, missing or undefined."""
+    try:
+        num, _, den = str(text).partition(":")
+        value = float(num) / float(den)
+        return round(value, 6) if value > 0 else 1.0
+    except (ValueError, ZeroDivisionError):
+        return 1.0
 
 
 def _int(value):
@@ -63,14 +75,18 @@ def keyframe_stats(path, sample_sec=KEYFRAME_SAMPLE_SEC):
 
 def probe(path):
     path = os.path.abspath(path)
-    info = json.loads(_ffprobe("-show_entries",
-                               "format=duration:stream=codec_type,codec_name,width,height,"
+    info = json.loads(_ffprobe("-show_data_hash", "md5", "-show_entries",
+                               "format=duration:format_tags=creation_time:"
+                               "stream=codec_type,codec_name,width,height,"
                                "r_frame_rate,avg_frame_rate,field_order,pix_fmt,bit_rate,"
-                               "sample_rate,channels",
+                               "sample_rate,channels,sample_aspect_ratio,profile,level,"
+                               "time_base,extradata_hash",
                                "-of", "json", path))
     st = os.stat(path)
-    result = {"path": path, "id": source_id(path), "size": st.st_size, "mtime": st.st_mtime,
-              "duration_sec": None, "video": None, "audio": None, "keyframes": None}
+    result = {"probe_version": PROBE_VERSION, "path": path, "id": source_id(path),
+              "size": st.st_size, "mtime": st.st_mtime, "duration_sec": None,
+              "creation_time": (info.get("format", {}).get("tags") or {}).get("creation_time"),
+              "video": None, "audio": None, "keyframes": None}
     try:
         result["duration_sec"] = float(info.get("format", {}).get("duration"))
     except (TypeError, ValueError):
@@ -82,11 +98,16 @@ def probe(path):
                 "height": _int(s.get("height")),
                 "fps": _rate(s.get("avg_frame_rate")) or _rate(s.get("r_frame_rate")),
                 "field_order": s.get("field_order") or "unknown",
-                "pix_fmt": s.get("pix_fmt"), "bit_rate": _int(s.get("bit_rate"))}
+                "pix_fmt": s.get("pix_fmt"), "bit_rate": _int(s.get("bit_rate")),
+                "sar": _sar(s.get("sample_aspect_ratio")), "profile": s.get("profile"),
+                "level": _int(s.get("level")), "time_base": s.get("time_base"),
+                # Identical decoder setup is what lets two files be joined losslessly.
+                "extradata_md5": (s.get("extradata_hash") or "").removeprefix("MD5:") or None}
         elif s.get("codec_type") == "audio" and result["audio"] is None:
             result["audio"] = {"codec": s.get("codec_name"),
                                "sample_rate": _int(s.get("sample_rate")),
-                               "channels": _int(s.get("channels"))}
+                               "channels": _int(s.get("channels")),
+                               "bit_rate": _int(s.get("bit_rate"))}
     if result["video"]:
         try:
             result["keyframes"] = keyframe_stats(path)

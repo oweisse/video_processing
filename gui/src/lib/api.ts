@@ -3,12 +3,18 @@
 export type SourceKind = "tape" | "digital";
 
 export interface Probe {
+  probe_version?: number;
   path: string;
   id: string;
   size: number;
   duration_sec: number | null;
-  video: { codec: string; width: number; height: number; fps: number | null; field_order: string } | null;
-  audio: { codec: string; sample_rate: number; channels: number } | null;
+  creation_time?: string | null;
+  video: {
+    codec: string; width: number; height: number; fps: number | null; field_order: string;
+    pix_fmt?: string; bit_rate?: number | null; sar?: number; profile?: string | null;
+    level?: number | null; time_base?: string | null; extradata_md5?: string | null;
+  } | null;
+  audio: { codec: string; sample_rate: number; channels: number; bit_rate?: number | null } | null;
   keyframes: { mean_interval_sec: number; max_interval_sec: number } | null;
 }
 
@@ -84,6 +90,46 @@ export interface PlanWindow {
   user_pick?: number | null;
 }
 
+export interface CandidateSetting {
+  name: string;
+  label: string;
+  value: unknown;
+  shown: string;
+  origin: "candidate" | "tuning" | "default";
+  applies: boolean;
+  advanced: boolean;
+  help: string;
+}
+
+export interface CandidateSettings {
+  index: number;
+  window: string;
+  describe: string;
+  rows: CandidateSetting[];
+  render_command: string;
+  explicit_command: string | null;
+}
+
+export interface StorageRow {
+  id: string;
+  name: string;
+  exists: boolean;
+  versions: number;
+  tunings: number;
+  original: number;
+  editing: number;
+  tuning: number;
+  rendered: number;
+  extra: number;
+}
+
+export interface StorageUsage {
+  project: string | null;
+  videos: StorageRow[];
+  totals: { original: number; editing: number; tuning: number; rendered: number; extra: number; project_files: number; exported: number };
+  trash: number;
+}
+
 export interface Plan {
   path: string;
   dir: string;
@@ -115,6 +161,7 @@ export interface ProjectSummary {
   clips: number;
   export_path: string;
   exported: boolean;
+  videos?: string[]; // its videos (source ids), in its own order
 }
 
 export interface ExportPlan {
@@ -124,6 +171,40 @@ export interface ExportPlan {
   canvas: { width: number; height: number; fps: number };
   output: string;
   output_exists: boolean;
+  missing?: string[]; // files the export needs that are gone
+}
+
+/** A size-budget estimate (export.py --estimate; docs/stitch-and-size-budget-plan.md §10.4). */
+export interface SizeEstimate {
+  key: string;
+  created: string;
+  mode: "copy" | "quality" | "size";
+  budget_bytes: number;
+  predicted_bytes: number;
+  video_bps: number | null;
+  source_bps: number | null;
+  cap: "source" | "budget";
+  codec: "h264" | "hevc";
+  width: number;
+  height: number;
+  duration_sec: number;
+  crf: number | null;
+  crf_equivalent: number | null;
+  passes: number;
+  metric: "vmaf" | "ssim" | null;
+  quality_mean: number | null;
+  quality_low: number | null;
+  quality_low_at_sec: number | null;
+  words: string | null;
+  encode_minutes: number | null;
+  samples: { at_sec: number; weight: number; bps: number; quality: number }[];
+  suggest_height: number | null;
+  suggest_quality?: number | null;
+  quality_low_video?: string | null;
+  footage?: { height: number; seconds: number } | null;
+  audio?: { codec: string; bps: number; channels: number; sample_rate: number };
+  estimate_sec?: number;
+  notes: string[];
 }
 
 export interface ExportFile {
@@ -221,21 +302,34 @@ const q = (params: Record<string, string | number | null | undefined>) =>
   ).toString();
 
 export const api = {
+  candidateSettings: (plan: string, window: string, index: number) =>
+    call<CandidateSettings>("GET", `/api/plans/candidate_settings?${q({ plan, window, index: String(index) })}`),
   appInfo: () => call<{ native: boolean; version: string }>("GET", "/api/app"),
-  pick: (kind: "file" | "dir" | "audio", start?: string) =>
-    call<{ path: string | null }>("GET", `/api/fs/pick?${q({ kind, start })}`),
+  memory: () => call<{ used: number | null; budget: number | null; total: number | null; machine_used: number | null }>("GET", "/api/memory"),
+  pick: (kind: "file" | "dir" | "audio", start?: string, multiple = false) =>
+    call<{ path: string | null; paths: string[] }>("GET", `/api/fs/pick?${q({ kind, start, multiple: multiple ? "true" : null })}`),
   library: () => call<Library>("GET", "/api/library"),
   rescan: () => call<Library>("POST", "/api/library/rescan"),
   openProject: (output_dir: string) => call<Library>("POST", "/api/library/open", { output_dir }),
   probe: (id: string) => call<Probe>("GET", `/api/sources/${id}/probe`),
   addSource: (path: string) => call<Source>("POST", "/api/sources", { path }),
+  /** Several videos at once: files, and/or every video directly inside a folder. */
+  addSources: (sel: { paths?: string[]; folder?: string }) =>
+    call<{ added: Source[]; missing: string[] }>("POST", "/api/sources/many", sel),
   fsList: (dir: string) => call<FsList>("GET", `/api/fs/list?${q({ dir })}`),
   reveal: (path: string) => call("POST", "/api/reveal", { path }),
-  deleteOutput: (name: string) => call<{ moved: string[] }>("POST", `/api/outputs/${encodeURIComponent(name)}/delete`),
+  renameOutput: (name: string, tag: string) =>
+    call<{ file: string; path: string; projects: string[] }>("POST", `/api/outputs/${encodeURIComponent(name)}/rename`, { tag }),
+  deleteOutput: (name: string) => call<{ moved: string[]; projects: string[] }>("POST", `/api/outputs/${encodeURIComponent(name)}/delete`),
+  outputUsedBy: (name: string) => call<{ used_by: { project: string; clips: number }[] }>("GET", `/api/outputs/${encodeURIComponent(name)}/used-by`),
+  storage: (project?: string | null) => call<StorageUsage>("GET", `/api/storage${project ? `?${q({ project })}` : ""}`),
+  emptyTrash: () => call<{ freed: number }>("POST", "/api/trash/empty"),
   previewName: (source_id: string, start_sec: number, duration_sec: number | null, tag: string | null) =>
     call<{ name: string; exists: boolean }>("GET", `/api/outputs/preview-name?${q({ source_id, start_sec, duration_sec, tag })}`),
   setPick: (plan_path: string, window: string, index: number | null) =>
     call<PlanWindow>("POST", "/api/plans/pick", { plan_path, window, index }),
+  deleteTuning: (plan_path: string, window: string) =>
+    call<{ ok: boolean; trash: string }>("POST", "/api/plans/window/delete", { plan_path, window }),
   deleteCandidates: (plan_path: string, window: string) =>
     call("POST", "/api/plans/candidates/delete", { plan_path, window }),
   cliSchema: () => call<CliOption[]>("GET", "/api/cli/schema"),
@@ -248,6 +342,8 @@ export const api = {
   addMusic: (name: string, path: string) =>
     call<{ path: string; duration_sec: number | null }>("POST", `/api/projects/${encodeURIComponent(name)}/music`, { path }),
   exportPlan: (name: string) => call<ExportPlan>("GET", `/api/projects/${encodeURIComponent(name)}/plan`),
+  exportEstimate: (name: string) =>
+    call<{ estimate: SizeEstimate | null; stale: boolean }>("GET", `/api/projects/${encodeURIComponent(name)}/estimate`),
   thumbs: (source: string) => call<{ interval: number; count: number }>("GET", `/media/thumbs?${q({ source })}`),
   jobs: () => call<Job[]>("GET", "/api/jobs"),
   job: (id: string) => call<Job>("GET", `/api/jobs/${id}`),
@@ -263,9 +359,13 @@ export const api = {
 export const media = {
   file: (path: string) => `/media/file?${q({ path })}`,
   /** A frame of a source at `t` seconds (the server keeps it to 0.1 s). */
-  frame: (source: string, t: number, w: 160 | 320 = 160) => `/media/frame?${q({ source, t: Math.round(t * 10) / 10, w })}`,
-  outputAudio: (file: string) => `/media/audio?${q({ kind: "output", file })}`,
-  originalFor: (file: string) => `/media/audio?${q({ kind: "original_for", file })}`,
+  frame: (source: string, t: number, w: 160 | 320 | 960 = 160) => `/media/frame?${q({ source, t: Math.round(t * 10) / 10, w })}`,
+  /** An output's sound; with a duration, only that stretch (seconds into the output). */
+  outputAudio: (file: string, start?: number, duration?: number) =>
+    `/media/audio?${q({ kind: "output", file, start, duration })}`,
+  /** The original sound under an output's window; with a duration, only that stretch. */
+  originalFor: (file: string, start?: number, duration?: number) =>
+    `/media/audio?${q({ kind: "original_for", file, start, duration })}`,
   original: (source: string, start: number, duration: number | null) =>
     `/media/audio?${q({ kind: "original", source, start, duration })}`,
 };

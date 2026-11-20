@@ -13,14 +13,14 @@ import webbrowser
 from . import settings
 
 DEFAULT_PORT = 8787
-VIDEO_TYPES = ("Videos (*.mp4;*.mov;*.m4v;*.mkv)", "All files (*.*)")
+VIDEO_TYPES = ("Videos (*.mp4;*.mov;*.m4v;*.mkv;*.avi;*.mts;*.m2ts)", "All files (*.*)")
 AUDIO_TYPES = ("Audio (*.mp3;*.m4a;*.aac;*.wav;*.flac;*.aiff;*.ogg)", "All files (*.*)")
 
 
 def build_parser():
     p = argparse.ArgumentParser(
         prog="clean-audio-gui",
-        description="Open the Video Audio Cleaner GUI over clean-audio, clean-audio-tune and "
+        description="Open the Video Master GUI over clean-audio, clean-audio-tune and "
                     "the outputs they wrote.")
     p.add_argument("--output_dir", default=None,
                    help="Project folder to open (default: the last one used).")
@@ -41,10 +41,11 @@ class NativeDialogs:
     def __init__(self):
         self.window = None
 
-    def pick(self, kind, start=None):
+    def pick(self, kind, start=None, multiple=False):
+        """The chosen paths (several when `multiple`), or an empty list."""
         import webview
         if self.window is None:
-            return None
+            return []
         directory = os.path.expanduser(start or "~")
         if not os.path.isdir(directory):
             directory = os.path.dirname(directory) if os.path.isdir(
@@ -54,9 +55,9 @@ class NativeDialogs:
                                                     directory=directory)
         else:
             result = self.window.create_file_dialog(
-                webview.FileDialog.OPEN, directory=directory,
+                webview.FileDialog.OPEN, directory=directory, allow_multiple=bool(multiple),
                 file_types=AUDIO_TYPES if kind == "audio" else VIDEO_TYPES)
-        return result[0] if result else None
+        return list(result or [])
 
 
 def _serve(app, port):
@@ -81,7 +82,7 @@ def _window(app, url, dialogs):
                          "(or run with --browser).") from None
     bounds = settings.load().get("window_bounds") or {}
     window = webview.create_window(
-        "Video Audio Cleaner", url, width=bounds.get("width", 1440),
+        "Video Master", url, width=bounds.get("width", 1440),
         height=bounds.get("height", 920), x=bounds.get("x"), y=bounds.get("y"),
         min_size=(1180, 700), background_color="#1c1c1f", text_select=True)
     dialogs.window = window
@@ -108,7 +109,7 @@ def main(argv=None):
     dialogs = NativeDialogs() if args.mode == "window" else None
     app = create_app(output_dir, dialogs=dialogs)
     server, thread = _serve(app, args.port)
-    print(f"Video Audio Cleaner GUI on {url}  (Ctrl+C to stop)")
+    print(f"Video Master GUI on {url}  (Ctrl+C to stop)")
     try:
         if args.mode == "window":
             _window(app, url, dialogs)

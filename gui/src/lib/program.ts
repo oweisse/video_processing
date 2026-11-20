@@ -1,22 +1,38 @@
 // Plays an edit: cleaned (or original) audio per clip scheduled on the Web Audio
 // clock, the music bed under it, and the picture from 540p proxies on two
-// alternating <video> elements so cuts do not stall. Crossfades are heard; the
-// picture cuts at their midpoint. Ducking is applied on export only.
+// alternating <video> elements so cuts do not stall. Crossfades and soft cuts are heard
+// as the export renders them (export.joins / edit.joinsOf); the picture cuts at a
+// crossfade's midpoint. Ducking is applied on export only. Sound longer than a few
+// minutes is streamed (lib/voices.ts) rather than decoded.
 import { decode } from "./audio";
-import { clipAt, place, type Clip, type MusicClip, type Placed } from "./edit";
+import { PRELOAD, STREAM_AFTER, StreamVoice } from "./voices";
+import {
+  clipAt, gainAt, joinsOf, place, voiceShape, type Clip, type Fade, type Frame, type JoinInfo, type MusicClip, type Placed,
+} from "./edit";
 
 export interface Resolver {
   proxy(sourceId: string): string;
-  clipAudio(clip: Clip): { url: string; offset: number }; // offset: buffer time at clip.in_sec
+  /**
+   * The clip's sound with `pre`/`post` seconds to spare around it. offset: media time at
+   * clip.in_sec; seconds: how long the media behind the URL is (long media is streamed).
+   */
+  clipAudio(clip: Clip, pre: number, post: number): { url: string; offset: number; seconds?: number | null };
   music(m: MusicClip): string;
+  joinInfo: JoinInfo;
+  /** The framing of the clip `t` seconds into it (zoom glides move it); default its frame. */
+  frameAt?(index: number, t: number): Frame | null | undefined;
 }
+
+const CURVE_POINTS = 33;
 
 const LEAD = 0.05;
 
 export class Program {
   private placed: Placed[] = [];
+  private shapes: { pre: number; post: number; fades: Fade[] }[] = [];
   private music: MusicClip[] = [];
   private nodes: AudioScheduledSourceNode[] = [];
+  private streams = new Map<number, StreamVoice>(); // clip index → its live streamed voice
   private startedAt = 0;
   private startOffset = 0;
   private pausedAt = 0;
@@ -54,6 +70,8 @@ export class Program {
     const was = this.playing;
     this.stopNodes();
     this.placed = place(clips);
+    const joins = joinsOf(clips, this.resolve.joinInfo);
+    this.shapes = this.placed.map((_, i) => voiceShape(this.placed, joins, i));
     this.music = music;
     this.duration = this.placed.length ? this.placed[this.placed.length - 1].start + this.placed[this.placed.length - 1].length : 0;
     this.pausedAt = Math.min(t, this.duration);
@@ -61,9 +79,10 @@ export class Program {
     const token = ++this.loadToken;
     this.loading = true;
     this.emit();
-    // Decode what the edit needs (cached by URL, so unchanged clips are instant).
+    // Decode what the edit needs (cached by URL, so unchanged clips are instant); long
+    // sound is streamed when it plays.
     await Promise.allSettled([
-      ...this.placed.map((p) => (p.clip.audio?.mute ? null : decode(this.resolve.clipAudio(p.clip).url))),
+      ...this.placed.map((p) => (p.clip.audio?.mute || this.streamed(p.index) ? null : decode(this.audioOf(p.index).url))),
       ...music.map((m) => decode(this.resolve.music(m))),
     ]);
     if (token !== this.loadToken) return;
@@ -71,6 +90,16 @@ export class Program {
     if (was && this.playing) this.startNodes(this.pausedAt);
     this.showFrame(this.pausedAt, false);
     this.emit();
+  }
+
+  private audioOf(i: number) {
+    const { pre, post } = this.shapes[i];
+    return this.resolve.clipAudio(this.placed[i].clip, pre, post);
+  }
+
+  /** Whether a clip's sound is streamed rather than decoded. */
+  private streamed(i: number): boolean {
+    return (this.audioOf(i).seconds ?? Infinity) > STREAM_AFTER;
   }
 
   get time(): number {
@@ -118,32 +147,26 @@ export class Program {
     this.startedAt = when;
     this.startOffset = from;
     for (const p of this.placed) {
-      const end = p.start + p.length;
-      if (end <= from || p.clip.audio?.mute) continue;
-      const { url, offset } = this.resolve.clipAudio(p.clip);
+      const { pre, post, fades } = this.shapes[p.index];
+      // A blend's sound starts before its clip and runs on after it.
+      const vStart = p.start - pre, vEnd = p.start + p.length + post;
+      if (vEnd <= from || p.clip.audio?.mute || this.streamed(p.index)) continue;
+      const { url, offset } = this.audioOf(p.index);
       const buffer = (await decode(url).catch(() => null))?.buffer;
       if (!buffer || !this.playing || this.startedAt !== when) continue;
-      const into = Math.max(0, from - p.start);
+      const into = Math.max(0, from - vStart);
       const gain = this.ctx.createGain();
       const g = 10 ** ((p.clip.audio?.gain_db ?? 0) / 20);
-      const at = when + Math.max(0, p.start - from);
-      // crossfades: ramp in over the overlap, and out under the next clip's fade
-      const next = this.placed[p.index + 1];
-      const fadeOut = next?.fadeIn ?? 0;
-      gain.gain.setValueAtTime(p.fadeIn && into < p.fadeIn ? (g * into) / p.fadeIn : g, at);
-      if (p.fadeIn && into < p.fadeIn) gain.gain.linearRampToValueAtTime(g, at + (p.fadeIn - into));
-      if (fadeOut) {
-        const fadeStart = when + (end - fadeOut - from);
-        if (fadeStart > at) gain.gain.setValueAtTime(g, fadeStart);
-        gain.gain.linearRampToValueAtTime(0, when + (end - from));
-      }
+      const at = when + Math.max(0, vStart - from);
+      this.envelope(gain.gain, fades, g, Math.max(from, vStart), from, when);
       gain.connect(this.ctx.destination);
       const src = this.ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(gain);
-      src.start(at, offset + into, p.length - into);
+      src.start(at, offset - pre + into, vEnd - vStart - into);
       this.nodes.push(src);
     }
+    this.syncStreams();
     for (const m of this.music) {
       const length = m.out_sec - m.in_sec;
       const end = Math.min(this.duration, m.at_sec + length);
@@ -172,7 +195,56 @@ export class Program {
     }
   }
 
+  /**
+   * Keep the streamed voices to the clip playing now and the next one: create a voice a
+   * few seconds before its sound starts, let it go once it has played, and keep the
+   * live ones on the clock.
+   */
+  private syncStreams() {
+    if (!this.playing) return;
+    const now = this.time;
+    for (const p of this.placed) {
+      if (p.clip.audio?.mute || !this.streamed(p.index)) continue;
+      const { pre, post, fades } = this.shapes[p.index];
+      const vStart = p.start - pre, vEnd = p.start + p.length + post;
+      const live = this.streams.get(p.index);
+      if (vEnd <= now) {
+        if (live) {
+          live.release();
+          this.streams.delete(p.index);
+        }
+        continue;
+      }
+      if (live || vStart - now > PRELOAD) continue;
+      const t0 = Math.max(now, vStart);
+      const { url, offset } = this.audioOf(p.index);
+      const g = 10 ** ((p.clip.audio?.gain_db ?? 0) / 20);
+      const ctxAt = (t: number) => this.startedAt + (t - this.startOffset);
+      const voice = new StreamVoice(this.ctx, url, offset - pre + (t0 - vStart), ctxAt(t0), vEnd - t0,
+        (ct) => g * gainAt(fades, this.startOffset + (ct - this.startedAt)));
+      this.envelope(voice.gain.gain, fades, g, t0, this.startOffset, this.startedAt);
+      this.streams.set(p.index, voice);
+    }
+    for (const v of this.streams.values()) v.tick();
+  }
+
+  /** Schedule fades (timeline times) on a gain, from timeline time t0 on; `when` is when `from` plays. */
+  private envelope(param: AudioParam, fades: Fade[], g: number, t0: number, from: number, when: number) {
+    param.setValueAtTime(g * gainAt(fades, t0), when + (t0 - from));
+    let last = -Infinity;
+    for (const f of [...fades].sort((a, b) => a.from - b.from)) {
+      const a = Math.max(f.from, t0, last + 0.001), b = f.to;
+      if (b - a < 0.002) continue;
+      const curve = new Float32Array(CURVE_POINTS);
+      for (let k = 0; k < CURVE_POINTS; k++) curve[k] = g * gainAt(fades, a + ((b - a) * k) / (CURVE_POINTS - 1));
+      param.setValueCurveAtTime(curve, when + (a - from), b - a);
+      last = b;
+    }
+  }
+
   private stopNodes() {
+    for (const v of this.streams.values()) v.release();
+    this.streams.clear();
     for (const n of this.nodes) {
       try {
         n.stop();
@@ -184,6 +256,10 @@ export class Program {
     this.nodes = [];
   }
 
+  private frameOf(p: Placed, t: number) {
+    return this.resolve.frameAt ? this.resolve.frameAt(p.index, t - p.start) : p.clip.frame;
+  }
+
   /** Point a video at the clip showing at t; returns it. */
   private load(slot: number, p: Placed, t: number) {
     const v = this.videos[slot];
@@ -192,6 +268,7 @@ export class Program {
     const target = p.clip.in_sec + (t - p.start);
     if (this.shown[slot] !== p.clip.id || Math.abs(v.currentTime - target) > 0.3) v.currentTime = target;
     this.shown[slot] = p.clip.id;
+    showFrameOf(v, this.frameOf(p, t));
     return v;
   }
 
@@ -211,6 +288,7 @@ export class Program {
       this.active = slot;
     }
     const v = this.videos[slot];
+    showFrameOf(v, this.frameOf(p, t));
     const target = p.clip.in_sec + (t - p.start);
     const drift = v.currentTime - target;
     if (playing) {
@@ -241,6 +319,7 @@ export class Program {
       this.emit();
       return;
     }
+    this.syncStreams();
     const heard = this.playing ? Math.max(0, t - (this.ctx.outputLatency || this.ctx.baseLatency || 0)) : t;
     this.showFrame(heard, this.playing);
   }
@@ -254,4 +333,17 @@ export class Program {
     });
     this.listeners.clear();
   }
+}
+
+/** Show only a clip's zoom frame of the video, or the whole picture. */
+function showFrameOf(v: HTMLVideoElement, f: Frame | null | undefined) {
+  const st = v.style;
+  if (!st) return; // test doubles
+  st.objectFit = f ? "fill" : "";
+  st.width = f ? `${100 / f.w}%` : "";
+  st.height = f ? `${100 / f.h}%` : "";
+  st.left = f ? `${(-f.x / f.w) * 100}%` : "";
+  st.top = f ? `${(-f.y / f.h) * 100}%` : "";
+  st.right = f ? "auto" : "";
+  st.bottom = f ? "auto" : "";
 }

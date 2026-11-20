@@ -7,18 +7,6 @@ export interface Level {
   peakDb: number;
 }
 
-function biquad(x: Float32Array, b: number[], a: number[]): Float32Array {
-  const y = new Float32Array(x.length);
-  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
-  for (let i = 0; i < x.length; i++) {
-    const xi = x[i];
-    const yi = b[0] * xi + b[1] * x1 + b[2] * x2 - a[1] * y1 - a[2] * y2;
-    x2 = x1; x1 = xi; y2 = y1; y1 = yi;
-    y[i] = yi;
-  }
-  return y;
-}
-
 /** K-weighting filters for any sample rate (the libebur128 derivation). */
 export function kWeighting(fs: number): { b: number[]; a: number[] }[] {
   let f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
@@ -43,25 +31,38 @@ export interface ChannelSource {
 }
 
 export function measure(buf: ChannelSource): Level {
+  // Streams through the samples: the two K-weighting filters run sample by sample and
+  // only one energy per 100 ms step is kept, so an hour of sound needs no copies of it.
   const fs = buf.sampleRate;
   const block = Math.round(0.4 * fs), step = Math.round(0.1 * fs);
-  const filters = kWeighting(fs);
+  const [f1, f2] = kWeighting(fs);
   let peak = 0;
   let energies: Float64Array | null = null;
   for (let c = 0; c < buf.numberOfChannels; c++) {
     const raw = buf.getChannelData(c);
+    const steps = Math.floor(raw.length / step);
+    const sums = new Float64Array(steps + 1); // energy of each 100 ms step
+    let ax1 = 0, ax2 = 0, ay1 = 0, ay2 = 0, bx1 = 0, bx2 = 0, by1 = 0, by2 = 0;
     for (let i = 0; i < raw.length; i++) {
-      const v = Math.abs(raw[i]);
+      const xi = raw[i];
+      const v = xi < 0 ? -xi : xi;
       if (v > peak) peak = v;
+      const yi = f1.b[0] * xi + f1.b[1] * ax1 + f1.b[2] * ax2 - f1.a[1] * ay1 - f1.a[2] * ay2;
+      ax2 = ax1; ax1 = xi; ay2 = ay1; ay1 = yi;
+      const zi = f2.b[0] * yi + f2.b[1] * bx1 + f2.b[2] * bx2 - f2.a[1] * by1 - f2.a[2] * by2;
+      bx2 = bx1; bx1 = yi; by2 = by1; by1 = zi;
+      sums[Math.floor(i / step)] += zi * zi;
     }
-    let y = raw;
-    for (const f of filters) y = biquad(y, f.b, f.a);
-    // cumulative sum of squares for O(1) block energies
-    const cum = new Float64Array(y.length + 1);
-    for (let i = 0; i < y.length; i++) cum[i + 1] = cum[i] + y[i] * y[i];
-    const n = y.length < block ? 0 : Math.floor((y.length - block) / step) + 1;
+    // A 400 ms block every 100 ms is four consecutive steps (block = 4 × step at the
+    // rates used here; otherwise the block is rounded to whole steps).
+    const per = Math.max(1, Math.round(block / step));
+    const n = raw.length < block ? 0 : Math.floor((raw.length - block) / step) + 1;
     if (!energies) energies = new Float64Array(n);
-    for (let j = 0; j < n && j < energies.length; j++) energies[j] += (cum[j * step + block] - cum[j * step]) / block;
+    for (let j = 0; j < n && j < energies.length; j++) {
+      let e = 0;
+      for (let k = 0; k < per; k++) e += sums[j + k];
+      energies[j] += e / (per * step);
+    }
   }
   const peakDb = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
   if (!energies || energies.length === 0) return { lufs: -Infinity, peakDb };

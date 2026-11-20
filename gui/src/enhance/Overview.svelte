@@ -35,7 +35,7 @@
       </div>
     </div>
   {:else}
-    <p class="faint">No videos in this project yet. Add one in Media.</p>
+    <p class="faint">No videos in this library folder yet. Add some in Media.</p>
   {/each}
 </div>
 

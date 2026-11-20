@@ -1,0 +1,536 @@
+{
+ "about": "joins() / joinsOf() cases shared by tests/test_export.py and gui/src/lib/edit.test.ts (docs/stitch-and-size-budget-plan.md §7). sources: id -> length in seconds; files: audio file -> length when the clip does not record it. A blend's lead is how much of the overlap lies before the cut.",
+ "cases": [
+  {
+   "name": "cleaned pieces with sound to spare blend",
+   "sources": {
+    "s": 600,
+    "t": 300
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 100,
+     "out_sec": 200,
+     "audio": {
+      "file": "f1",
+      "start_sec": 50,
+      "duration_sec": 200
+     }
+    },
+    {
+     "source": "t",
+     "in_sec": 30,
+     "out_sec": 80,
+     "audio": {
+      "file": "f2",
+      "start_sec": 0,
+      "duration_sec": 120
+     },
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0.5
+    }
+   ]
+  },
+  {
+   "name": "a whole video ends: dip",
+   "sources": {
+    "s": 600,
+    "t": 300
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 600,
+     "audio": null
+    },
+    {
+     "source": "t",
+     "in_sec": 0,
+     "out_sec": 300,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "dip",
+     "sec": 1
+    }
+   ]
+  },
+  {
+   "name": "the next video starts at its beginning: the overlap comes after the cut",
+   "sources": {
+    "s": 600,
+    "t": 300
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 500,
+     "audio": null
+    },
+    {
+     "source": "t",
+     "in_sec": 0,
+     "out_sec": 300,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0
+    }
+   ]
+  },
+  {
+   "name": "back to back in one video with the same sound: plain cut",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 100,
+     "audio": null
+    },
+    {
+     "source": "s",
+     "in_sec": 100,
+     "out_sec": 200,
+     "audio": {
+      "gain_db": 0
+     },
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "cut",
+     "sec": 0
+    }
+   ]
+  },
+  {
+   "name": "back to back but the sound changes: blend",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 100,
+     "audio": null
+    },
+    {
+     "source": "s",
+     "in_sec": 100,
+     "out_sec": 200,
+     "audio": {
+      "file": "f",
+      "start_sec": 90,
+      "duration_sec": 200
+     },
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0.5
+    }
+   ]
+  },
+  {
+   "name": "crossfades keep their clamp",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 3,
+     "audio": null
+    },
+    {
+     "source": "s",
+     "in_sec": 50,
+     "out_sec": 60,
+     "audio": null,
+     "transition_in": {
+      "type": "crossfade",
+      "sec": 4
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "crossfade",
+     "sec": 1.5
+    }
+   ]
+  },
+  {
+   "name": "a short clip shortens the soft cut",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": null
+    },
+    {
+     "source": "s",
+     "in_sec": 50,
+     "out_sec": 51,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 2
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0.5
+    }
+   ]
+  },
+  {
+   "name": "a muted side dips",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": {
+      "mute": true
+     }
+    },
+    {
+     "source": "s",
+     "in_sec": 50,
+     "out_sec": 60,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "dip",
+     "sec": 1
+    }
+   ]
+  },
+  {
+   "name": "cleaned audio of unknown length has nothing to spare: with none on the other side either, dip",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": {
+      "file": "f",
+      "start_sec": 0
+     }
+    },
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 10,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "dip",
+     "sec": 1
+    }
+   ]
+  },
+  {
+   "name": "a recorded file length is used when the clip does not say",
+   "sources": {
+    "s": 600
+   },
+   "files": {
+    "f": 40
+   },
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": {
+      "file": "f",
+      "start_sec": 0
+     }
+    },
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 10,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0
+    }
+   ]
+  },
+  {
+   "name": "no transition is a cut",
+   "sources": {
+    "s": 600,
+    "t": 300
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20,
+     "audio": null
+    },
+    {
+     "source": "t",
+     "in_sec": 50,
+     "out_sec": 60,
+     "audio": null
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "cut",
+     "sec": 0
+    }
+   ]
+  },
+  {
+   "name": "a cleaned piece ends where the original goes on: the overlap moves into the original",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 30,
+     "audio": {
+      "file": "f",
+      "start_sec": 10,
+      "duration_sec": 20
+     }
+    },
+    {
+     "source": "s",
+     "in_sec": 30,
+     "out_sec": 60,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 1
+    }
+   ]
+  },
+  {
+   "name": "a cleaned piece starts where the original stops: the overlap moves after the cut",
+   "sources": {
+    "s": 600
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 10,
+     "audio": null
+    },
+    {
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 30,
+     "audio": {
+      "file": "f",
+      "start_sec": 10,
+      "duration_sec": 20
+     },
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0
+    }
+   ]
+  },
+  {
+   "name": "a little spare on each side is enough together",
+   "sources": {
+    "s": 600,
+    "t": 300
+   },
+   "files": {},
+   "clips": [
+    {
+     "source": "s",
+     "in_sec": 0,
+     "out_sec": 599.7,
+     "audio": null
+    },
+    {
+     "source": "t",
+     "in_sec": 0.8,
+     "out_sec": 20,
+     "audio": null,
+     "transition_in": {
+      "type": "soft_cut",
+      "sec": 1
+     }
+    }
+   ],
+   "expect": [
+    {
+     "kind": "cut",
+     "sec": 0
+    },
+    {
+     "kind": "blend",
+     "sec": 1,
+     "lead": 0.7
+    }
+   ]
+  }
+ ]
+}

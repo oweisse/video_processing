@@ -2,7 +2,10 @@
   // The edit's timeline: one picture+speech track, one music track (docs/gui-design.md §10).
   // Drag a clip to reorder, its edges to trim; drag music to move it. Changes are drafted
   // while dragging and committed on release.
-  import { place, type Clip, type MusicClip } from "../lib/edit";
+  import { place, zoomGlide, type Clip, type MusicClip } from "../lib/edit";
+  import { loadPref, savePref } from "../lib/prefs";
+  import { findOutput } from "../lib/state.svelte";
+  import { versionName, versionSettings } from "../media/pieces";
   import { formatClock } from "../lib/time";
 
   export type Selection = { kind: "clip" | "music"; id: string } | null;
@@ -13,6 +16,8 @@
     music,
     time,
     pps = $bindable(20),
+    viewWidth = $bindable(0),
+    memory = null,
     selected,
     thumbs,
     sourceLength,
@@ -20,11 +25,14 @@
     onseek,
     onselect,
     onchange,
+    onsound,
   }: {
     clips: Clip[];
     music: MusicClip[];
     time: number;
     pps?: number;
+    viewWidth?: number; // the visible width, for "fit"
+    memory?: string | null; // a key to remember how far it is scrolled (per project), across reloads
     selected: Selection;
     thumbs: Record<string, ThumbInfo | undefined>;
     sourceLength: (sourceId: string) => number;
@@ -32,8 +40,11 @@
     onseek: (t: number) => void;
     onselect: (s: Selection) => void;
     onchange: (clips: Clip[], music: MusicClip[]) => void;
+    /** The sound badge of a clip was clicked: choose its version there. */
+    onsound?: (clipId: string, anchor: DOMRect) => void;
   } = $props();
 
+  const outOf = (c: Clip) => (c.audio?.output ? findOutput(c.audio.output)?.output ?? null : null);
   let draftClips = $state<Clip[] | null>(null);
   let draftMusic = $state<MusicClip[] | null>(null);
   const shownClips = $derived(draftClips ?? clips);
@@ -41,15 +52,43 @@
   const placed = $derived(place(shownClips));
   const editEnd = $derived(placed.length ? placed[placed.length - 1].start + placed[placed.length - 1].length : 0);
   const musicEnd = $derived(Math.max(0, ...shownMusic.map((m) => m.at_sec + m.out_sec - m.in_sec)));
-  const width = $derived(Math.max(editEnd, musicEnd, 10) * pps + 400);
+  // A little room after the end (to drop a clip there), and never narrower than the view,
+  // so "fit" shows the whole edit without a scrollbar.
+  const width = $derived(Math.max(Math.max(editEnd, musicEnd, 1) * pps + 60, viewWidth));
 
   let scroller: HTMLDivElement;
+  // How far the timeline is scrolled, so a clip's badge and name stay at the left of the
+  // part of the clip in view instead of scrolling off with its left edge.
+  let scrollX = $state(0);
+  const stick = (start: number, length: number) =>
+    Math.max(0, Math.min(scrollX - start * pps, length * pps - 140));
   let insertAt = $state<number | null>(null);
 
-  // Keep the playhead in view while it moves.
+  // Remembered scroll: restored once the content is laid out, saved as it changes.
+  let restored = false;
+  $effect(() => {
+    if (restored || !scroller || !memory || !viewWidth || width <= viewWidth) return;
+    restored = true;
+    const saved = loadPref<number>(memory, 0);
+    if (saved > 0) scroller.scrollLeft = Math.min(saved, width - viewWidth);
+    scrollX = scroller.scrollLeft;
+  });
+  function scrolled() {
+    scrollX = scroller.scrollLeft;
+    if (memory && restored) savePref(memory, Math.round(scroller.scrollLeft));
+  }
+
+  // Keep the playhead in view when it moves; zooming, opening the page (which keeps the
+  // remembered view) or scrolling by hand never pulls the view back to it.
+  let lastTime: number | null = null;
   $effect(() => {
     if (!scroller) return;
     const x = time * pps;
+    if (lastTime === null || lastTime === time) {
+      lastTime = time;
+      return;
+    }
+    lastTime = time;
     const { scrollLeft, clientWidth } = scroller;
     if (x > scrollLeft + clientWidth - 40) scroller.scrollLeft = x - 80;
     else if (x < scrollLeft) scroller.scrollLeft = Math.max(0, x - 80);
@@ -58,13 +97,10 @@
   const tick = $derived([1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800].find((s) => s * pps >= 70) ?? 3600);
   const ticks = $derived(Array.from({ length: Math.ceil(width / pps / tick) + 1 }, (_, i) => i * tick));
 
+  // Scrolling never zooms (only the Zoom −/+ do, like the video strips); a pinch or
+  // ⌘-scroll would otherwise zoom the whole page, so it does nothing here.
   function wheel(ev: WheelEvent) {
-    if (!(ev.metaKey || ev.ctrlKey)) return;
-    ev.preventDefault();
-    const rect = scroller.getBoundingClientRect();
-    const at = (scroller.scrollLeft + ev.clientX - rect.left) / pps;
-    pps = Math.max(0.5, Math.min(400, pps * (ev.deltaY < 0 ? 1.15 : 1 / 1.15)));
-    scroller.scrollLeft = at * pps - (ev.clientX - rect.left);
+    if (ev.metaKey || ev.ctrlKey) ev.preventDefault();
   }
 
   function timeAt(ev: PointerEvent) {
@@ -183,7 +219,7 @@
   });
 </script>
 
-<div class="timeline" bind:this={scroller} onwheel={wheel}>
+<div class="timeline" bind:this={scroller} bind:clientWidth={viewWidth} onwheel={wheel} onscroll={scrolled}>
   <div class="content" style="width:{width}px" onpointermove={move} onpointerup={up} role="presentation">
     <div class="ruler" onpointerdown={startSeek} role="presentation">
       {#each ticks as t}
@@ -210,13 +246,28 @@
             {/each}
           </div>
           {#if p.fadeIn}<div class="fade" style="width:{p.fadeIn * pps}px"></div>{/if}
-          <div class="label">
-            {sourceName(c.source)} · {formatClock(c.in_sec, false)}
-            {#if c.audio?.mute}· muted{:else if !c.audio?.file}· original audio{/if}
-          </div>
+          <button class="sound" style:left="{4 + stick(p.start, p.length)}px" style:max-width="calc(100% - {8 + stick(p.start, p.length)}px)" class:orig={!c.audio?.file && !c.audio?.mute} class:mute={c.audio?.mute}
+                  title={c.audio?.mute ? "Muted · click to choose its sound"
+                    : !c.audio?.file ? "Plays the original, uncleaned sound · click to choose a cleaned version"
+                    : `Plays the cleaned version ${outOf(c) ? versionName(outOf(c)!) : c.audio.output}${outOf(c) ? ` (${versionSettings(outOf(c)!)})` : ""} · click to switch`}
+                  onpointerdown={(e) => e.stopPropagation()}
+                  onclick={(e) => { e.stopPropagation(); onselect({ kind: "clip", id: c.id }); onsound?.(c.id, (e.currentTarget as HTMLElement).getBoundingClientRect()); }}>
+            {#if c.audio?.mute}🔇 muted{:else if !c.audio?.file}⚠ original sound{:else}🔊 {outOf(c) ? versionName(outOf(c)!) : (c.audio.output ?? "cleaned")}{#if outOf(c) && versionSettings(outOf(c)!)}<span class="dim"> · {versionSettings(outOf(c)!)}</span>{/if}{/if} ▾
+          </button>
+          <div class="label" style:left="{6 + stick(p.start, p.length)}px">{sourceName(c.source)} · {formatClock(c.in_sec, false)}</div>
           <div class="handle left" onpointerdown={(e) => startClip(e, c, "in")} role="presentation"></div>
           <div class="handle right" onpointerdown={(e) => startClip(e, c, "out")} role="presentation"></div>
         </div>
+        {#if p.index > 0 && zoomGlide(placed[p.index - 1].clip, c)}
+          {@const g = zoomGlide(placed[p.index - 1].clip, c)!}
+          <div class="glide" style="left:{p.start * pps}px;width:{Math.max(3, g.sec * pps)}px"
+               title="Zoom glide: the framing moves smoothly into this clip's over {g.sec} s (select the clip to change or turn off)"></div>
+        {/if}
+        {#if c.transition_in?.type === "soft_cut" && p.index > 0}
+          <div class="soft" style="left:{p.start * pps - 7}px" title="Soft sound into this clip ({c.transition_in.sec} s)">
+            <svg viewBox="-1 -1 12 12" width="14" height="14" aria-hidden="true"><path d="M5 0 L10 5 L5 10 L0 5 Z" /></svg>
+          </div>
+        {/if}
       {/each}
       {#if insertX !== null}<div class="insert" style="left:{insertX}px"></div>{/if}
       {#if !placed.length}<div class="empty">Add clips from the source viewer above (mark In and Out, then ＋ Add).</div>{/if}
@@ -243,12 +294,12 @@
 </div>
 
 <style>
-  .timeline {
+  .timeline { isolation: isolate;
     overflow-x: auto; overflow-y: hidden; background: var(--bg-sunken);
     border: 1px solid var(--border); border-radius: var(--radius); user-select: none;
   }
   .content { position: relative; height: 162px; }
-  .ruler { position: relative; height: 22px; border-bottom: 1px solid var(--border); cursor: text; }
+  .ruler { position: relative; height: 22px; border-bottom: 1px solid var(--border); cursor: text; overflow: hidden; }
   .tick { position: absolute; top: 0; height: 100%; border-left: 1px solid var(--border); }
   .tick span { position: absolute; left: 3px; top: 3px; font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
   .track { position: relative; border-bottom: 1px solid var(--border); }
@@ -263,10 +314,25 @@
   .clip.sel, .mclip.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
   .strip { position: absolute; inset: 0 0 18px 0; overflow: hidden; }
   .strip img { position: absolute; top: 0; height: 100%; object-fit: cover; pointer-events: none; opacity: 0.9; }
+  /* A soft cut: the picture cuts here, the sound passes softly. */
+  .soft {
+    position: absolute; top: 50%; margin-top: -7px; width: 14px; height: 14px;
+    pointer-events: none; z-index: 1000; fill: var(--select); stroke: #000; stroke-width: 1.2;
+  }
   .fade {
     position: absolute; left: 0; top: 0; bottom: 0; pointer-events: none;
     background: linear-gradient(to right, rgb(0 0 0 / 0.55), transparent);
   }
+  .sound {
+    position: absolute; left: 4px; top: 4px; max-width: calc(100% - 8px); z-index: 2;
+    padding: 1px 6px; font-size: 10.5px; line-height: 15px; border-radius: 4px; cursor: pointer;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    background: color-mix(in srgb, var(--b-color) 85%, black); color: #000; border: none;
+  }
+  .sound .dim { color: rgb(0 0 0 / 0.65); }
+  .sound.orig { background: var(--a-color); color: #000; }
+  .sound.mute { background: var(--bg-header); color: var(--text-dim); }
+  .sound:hover { filter: brightness(1.15); }
   .label {
     position: absolute; left: 6px; right: 6px; bottom: 2px; font-size: 11px; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; color: var(--text); pointer-events: none;
@@ -277,6 +343,10 @@
   .handle.left { left: 0; }
   .handle.right { right: 0; }
   .handle:hover { background: rgb(255 255 255 / 0.25); }
+  .glide {
+    position: absolute; top: 2px; height: 4px; z-index: 900; pointer-events: auto; border-radius: 2px;
+    background: linear-gradient(to right, var(--accent), transparent); opacity: 0.9;
+  }
   .insert { position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1px; background: var(--accent); }
   .playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); pointer-events: none; z-index: 100; }
   .empty { position: absolute; left: 14px; top: 32px; color: var(--text-faint); font-size: 13px; }

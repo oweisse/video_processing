@@ -1,0 +1,155 @@
+{
+ "about": "suggest_canvas() cases shared by tests/test_export.py and gui/src/lib/edit.test.ts (docs/stitch-and-size-budget-plan.md §3.2)",
+ "cases": [
+  {
+   "name": "one video",
+   "items": [
+    {
+     "display_width": 1280,
+     "height": 720,
+     "fps": 30,
+     "seconds": 600
+    }
+   ],
+   "expect": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+   }
+  },
+  {
+   "name": "largest picture wins the size",
+   "items": [
+    {
+     "display_width": 1280,
+     "height": 720,
+     "fps": 30,
+     "seconds": 3000
+    },
+    {
+     "display_width": 1920,
+     "height": 1080,
+     "fps": 25,
+     "seconds": 60
+    }
+   ],
+   "expect": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30
+   }
+  },
+  {
+   "name": "rate with the most minutes wins",
+   "items": [
+    {
+     "display_width": 720,
+     "height": 576,
+     "fps": 25,
+     "seconds": 100
+    },
+    {
+     "display_width": 720,
+     "height": 576,
+     "fps": 25,
+     "seconds": 100
+    },
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 29.97,
+     "seconds": 150
+    }
+   ],
+   "expect": {
+    "width": 720,
+    "height": 576,
+    "fps": 25
+   }
+  },
+  {
+   "name": "29.97 and 30 are different rates",
+   "items": [
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 29.97,
+     "seconds": 100
+    },
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 30,
+     "seconds": 120
+    }
+   ],
+   "expect": {
+    "width": 640,
+    "height": 480,
+    "fps": 30
+   }
+  },
+  {
+   "name": "rates within 0.01 are one rate",
+   "items": [
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 29.97,
+     "seconds": 70
+    },
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 29.97003,
+     "seconds": 70
+    },
+    {
+     "display_width": 640,
+     "height": 480,
+     "fps": 30,
+     "seconds": 120
+    }
+   ],
+   "expect": {
+    "width": 640,
+    "height": 480,
+    "fps": 29.97
+   }
+  },
+  {
+   "name": "same area: the one with more seconds",
+   "items": [
+    {
+     "display_width": 960,
+     "height": 720,
+     "fps": 30,
+     "seconds": 10
+    },
+    {
+     "display_width": 1280,
+     "height": 540,
+     "fps": 30,
+     "seconds": 500
+    }
+   ],
+   "expect": {
+    "width": 1280,
+    "height": 540,
+    "fps": 30
+   }
+  },
+  {
+   "name": "nothing usable",
+   "items": [
+    {
+     "display_width": null,
+     "height": null,
+     "fps": 30,
+     "seconds": 5
+    }
+   ],
+   "expect": null
+  }
+ ]
+}

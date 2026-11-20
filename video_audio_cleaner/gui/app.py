@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, Optional
@@ -13,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
     StreamingResponse
 from pydantic import BaseModel, Field
 
-from .. import export as export_mod, prep, tune
+from .. import export as export_mod, memory, prep, probe as probe_mod, tune
 from ..events import clean as json_safe
 from . import commands, library as library_mod, media, projects, settings
 from .jobs import JobQueue
@@ -34,6 +35,9 @@ class CleanRequest(BaseModel):
     autotune: bool = True
     source_kind: Optional[Literal["tape", "digital"]] = None
     separate_music: bool = False
+    # The form's choice: None = use separate_music as given (older callers); False = keep
+    # the background music (separate it and put it back at its own level); True = remove it.
+    remove_music: Optional[bool] = None
     tag: Optional[str] = None
     output: Optional[str] = None
     normalize: bool = True
@@ -59,6 +63,7 @@ class TuneRequest(BaseModel):
     windows: list[TuneWindow]
     source_kind: Literal["tape", "digital"]
     separate_music: bool = False
+    remove_music: Optional[bool] = None
 
 
 def _fmt_window(start, duration):
@@ -92,6 +97,7 @@ def create_app(output_dir=None, dialogs=None):
             state["library"].rescan()
 
     queue = JobQueue(on_finished=on_finished)
+    queue.cheap_stoppers.append(media.stop_all)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -101,7 +107,7 @@ def create_app(output_dir=None, dialogs=None):
         yield
         await queue.stop()
 
-    app = FastAPI(title="Video Audio Cleaner", lifespan=lifespan)
+    app = FastAPI(title="Video Master", lifespan=lifespan)
     app.state.queue = queue
     app.state.project = state
 
@@ -159,17 +165,34 @@ def create_app(output_dir=None, dialogs=None):
         except FileNotFoundError:
             raise HTTPException(404, f"No such file: {body.get('path')}")
 
+    @app.post("/api/sources/many")
+    def add_sources(body: dict = Body(...)):
+        """Several videos at once: {"paths": [...]} and/or {"folder": path}."""
+        try:
+            return lib().add_sources(body.get("paths") or [], body.get("folder"))
+        except FileNotFoundError as exc:
+            raise HTTPException(404, f"No videos found: {exc}")
+
+    @app.get("/api/memory")
+    async def memory_now():
+        """What the editor (the server and everything it started) uses, against its budget."""
+        used = await asyncio.to_thread(memory.our_usage)
+        return {"used": used, "budget": memory.budget_bytes(), "total": memory.total_bytes(),
+                "machine_used": memory.machine_used_fraction()}
+
     @app.get("/api/app")
     def app_info():
         from .. import __version__
         return {"native": dialogs is not None, "version": __version__}
 
     @app.get("/api/fs/pick")
-    async def fs_pick(kind: Literal["file", "dir", "audio"] = "file", start: Optional[str] = None):
+    async def fs_pick(kind: Literal["file", "dir", "audio"] = "file", start: Optional[str] = None,
+                      multiple: bool = False):
         if dialogs is None:
             raise HTTPException(501, "No native dialogs in a browser; use /api/fs/list.")
-        path = await asyncio.to_thread(dialogs.pick, kind, start)
-        return {"path": path}
+        paths = await asyncio.to_thread(dialogs.pick, kind, start, multiple)
+        paths = list(paths or [])
+        return {"path": paths[0] if paths else None, "paths": paths}
 
     @app.get("/api/fs/list")
     def fs_list(dir: str = Query("~")):
@@ -221,8 +244,66 @@ def create_app(output_dir=None, dialogs=None):
                     dst = trash / f"{Path(path).stem}.{os.getpid()}{Path(path).suffix}"
                 shutil.move(path, dst)
                 moved.append(str(dst))
+        from . import rename
+        projects_changed = rename.retarget_clips(lib().output_dir, out["path"], None)
         lib().rescan()
-        return {"moved": moved}
+        return {"moved": moved, "projects": projects_changed}
+
+    @app.get("/api/outputs/{name}/used-by")
+    def output_used_by(name: str):
+        """The project clips that play this output (asked before deleting it)."""
+        out = lib().output(name)
+        if out is None:
+            raise HTTPException(404, "Unknown output")
+        used = []
+        for item in projects.list_projects(lib().output_dir):
+            try:
+                p = projects.load(lib().output_dir, item["name"])
+            except (OSError, ValueError):
+                continue
+            n = sum(1 for c in (p.get("tracks") or {}).get("video") or []
+                    if (c.get("audio") or {}).get("output") == name)
+            if n:
+                used.append({"project": item["name"], "clips": n})
+        return {"used_by": used}
+
+    @app.get("/api/storage")
+    async def storage_usage(project: Optional[str] = None):
+        """Disk used per video (original, editing copies, tuning audio, rendered versions),
+        for one project's videos or the whole library."""
+        from . import storage
+        if project and not projects.path(lib().output_dir, project).is_file():
+            raise HTTPException(404, "Unknown project")
+        return await asyncio.to_thread(storage.usage, lib().output_dir, lib().get(), project)
+
+    @app.post("/api/trash/empty")
+    def empty_trash():
+        """Delete what the library's _trash holds, for good."""
+        from . import storage
+        trash = lib().output_dir / "_trash"
+        freed = storage.du(trash)
+        if trash.is_dir():
+            shutil.rmtree(trash)
+        return {"freed": freed}
+
+    @app.post("/api/outputs/{name}/rename")
+    def rename_output(name: str, body: dict = Body(...)):
+        """Change a cleaned version's label (the tag in its file name)."""
+        from . import rename
+        out = lib().output(name)
+        if out is None:
+            raise HTTPException(404, "Unknown output")
+        if any(j["state"] in ("queued", "running") and (j.get("result") or {}).get("output") == out["path"]
+               for j in queue.jobs.values()):
+            raise HTTPException(409, "It is still being written")
+        try:
+            target, updated = rename.rename_output(lib().output_dir, out["path"], body.get("tag"))
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        lib().rescan()
+        return {"file": target.name, "path": str(target), "projects": updated}
 
     @app.get("/api/outputs/preview-name")
     def preview_name(source_id: str, start_sec: float = 0.0,
@@ -241,6 +322,15 @@ def create_app(output_dir=None, dialogs=None):
         if not path.startswith(root + os.sep) or not os.path.isfile(path):
             raise HTTPException(403, "Not a tuning plan of this project")
         return Path(path)
+
+    @app.get("/api/plans/candidate_settings")
+    def get_candidate_settings(plan: str, window: str, index: int = Query(ge=0)):
+        """Every setting one tuned candidate stands for (what rendering it would use)."""
+        from ..candidate_settings import candidate_settings
+        try:
+            return candidate_settings(_plan_path(plan), window, index)
+        except RuntimeError as exc:
+            raise HTTPException(404, str(exc))
 
     @app.post("/api/plans/pick")
     def set_pick(body: dict = Body(...)):
@@ -269,6 +359,39 @@ def create_app(output_dir=None, dialogs=None):
         os.replace(tmp, plan_path)
         lib().rescan()
         return {"ok": True}
+
+    @app.post("/api/plans/window/delete")
+    def delete_tuning_window(body: dict = Body(...)):
+        """Remove one tuned window (a blue bar) from its tuning run: its measurements, its
+        kept candidate audio and its listening file go to the library's _trash. A run left
+        with no windows goes there whole. Rendered versions stay."""
+        plan_path = _plan_path(body.get("plan_path") or "")
+        label = body.get("window")
+        if any(j["state"] in ("queued", "running") and j["type"] in ("tune", "clean", "clean_candidate")
+               and str(plan_path.parent) in " ".join(j["argv"]) for j in queue.jobs.values()):
+            raise HTTPException(409, "A job is still using this tuning run")
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        entry = next((w for w in plan["windows"] if w["label"] == label), None)
+        if entry is None:
+            raise HTTPException(404, "Unknown window")
+        trash = lib().output_dir / "_trash" / f"{plan_path.parent.name}.{os.getpid()}.{int(time.time())}"
+        def to_trash(path):
+            if path.exists():
+                trash.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(trash / path.name))
+        plan["windows"] = [w for w in plan["windows"] if w is not entry]
+        if not plan["windows"]:
+            to_trash(plan_path.parent)
+        else:
+            files = entry.get("candidate_files")
+            if files:
+                to_trash(plan_path.parent / files["dir"])
+            to_trash(plan_path.parent / "listen" / f"{label}.wav")
+            tmp = plan_path.with_name("plan.json.partial")
+            tmp.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, plan_path)
+        lib().rescan()
+        return {"ok": True, "trash": str(trash)}
 
     @app.get("/api/cli/schema")
     def cli_schema():
@@ -317,6 +440,13 @@ def create_app(output_dir=None, dialogs=None):
         kind, title, argv, meta = _build(body)
         return queue.submit(kind, title, argv, lib().output_dir, commands.display(argv), meta)
 
+    def _stretch_sec(source, start, duration):
+        """How long a stretch of a source is, for estimating a job's memory."""
+        if duration:
+            return float(duration)
+        total = ((source.get("probe") or {}).get("duration_sec") or 0.0)
+        return max(0.0, total - float(start or 0.0)) if total else 3600.0
+
     def _build(body):
         kind = body.get("type")
         out_dir = lib().output_dir
@@ -324,19 +454,25 @@ def create_app(output_dir=None, dialogs=None):
             if kind == "clean":
                 req = CleanRequest(**body)
                 source = _source(req.source_id)
+                if req.remove_music is not None:
+                    req.separate_music = not req.remove_music
                 argv = commands.clean_argv(
                     source["path"], out_dir, req.start_sec, req.duration_sec, req.autotune,
                     req.source_kind, req.separate_music, (req.tag or "").strip() or None,
-                    (req.output or "").strip() or None, req.normalize, req.overrides)
+                    (req.output or "").strip() or None, req.normalize, req.overrides,
+                    commands.KEEP_MUSIC_LEVEL_DB if req.remove_music is False else None)
                 bits = [_fmt_window(req.start_sec, req.duration_sec)]
                 if req.autotune:
                     bits.append(f"autotune · {req.source_kind}")
-                if req.separate_music:
-                    bits.append("music")
+                if req.remove_music:
+                    bits.append("music removed")
+                elif req.separate_music:
+                    bits.append("music kept" if req.remove_music is False else "music")
                 if req.tag:
                     bits.append(req.tag)
                 title = f"Clean {source['name']} " + " · ".join(bits)
-                meta = {"source_id": source["id"], **req.model_dump()}
+                meta = {"source_id": source["id"], **req.model_dump(),
+                        "memory_gb": memory.clean_estimate_gb(_stretch_sec(source, req.start_sec, req.duration_sec))}
             elif kind == "clean_candidate":
                 req = CandidateRequest(**body)
                 plan_path = _plan_path(req.plan_path)
@@ -346,18 +482,25 @@ def create_app(output_dir=None, dialogs=None):
                                                req.index, tag)
                 title = f"Render candidate {req.index} of {Path(plan['source']).name} " \
                         f"{req.window}"
-                meta = req.model_dump()
+                win = next((w for w in plan.get("windows") or [] if w.get("label") == req.window
+                            or w.get("name") == req.window), None) if isinstance(plan, dict) else None
+                length = (win.get("end_sec", 0) - win.get("start_sec", 0)) if win else 600
+                meta = {**req.model_dump(), "memory_gb": memory.clean_estimate_gb(length)}
             elif kind == "tune":
                 req = TuneRequest(**body)
                 source = _source(req.source_id)
                 windows = [w.model_dump() for w in req.windows]
                 if any(w["end_sec"] <= w["start_sec"] for w in windows):
                     raise ValueError("Each window must end after it starts")
+                if req.remove_music is not None:
+                    req.separate_music = not req.remove_music
                 argv = commands.tune_argv(source["path"], out_dir, windows, req.source_kind,
-                                          req.separate_music)
+                                          req.separate_music,
+                                          f"{commands.KEEP_MUSIC_LEVEL_DB:g}" if req.remove_music is False else None)
                 title = f"Tune {source['name']} " + ", ".join(
                     commands.window_label(w["start_sec"], w["end_sec"]) for w in windows)
-                meta = {"source_id": source["id"], **req.model_dump()}
+                meta = {"source_id": source["id"], **req.model_dump(), "memory_gb": memory.clean_estimate_gb(
+                    max(w["end_sec"] - w["start_sec"] for w in windows))}
             elif kind == "prep":
                 source = _source(body.get("source_id") or "")
                 kinds = [k for k in body.get("kinds") or ("proxy", "thumbs", "peaks")
@@ -367,15 +510,16 @@ def create_app(output_dir=None, dialogs=None):
                 argv = commands.prep_argv(source["path"], library_mod.prep_cache(out_dir),
                                           source["id"], kinds)
                 title = f"Prepare {source['name']} for editing"
-                meta = {"source_id": source["id"], "kinds": kinds}
-            elif kind == "export":
+                meta = {"source_id": source["id"], "kinds": kinds, "memory_gb": memory.LIGHT_JOB_GB}
+            elif kind in ("export", "export_estimate"):
                 name = body.get("project") or ""
                 path = projects.path(out_dir, name)
                 if not path.is_file():
                     raise HTTPException(404, "Unknown project")
-                argv = commands.export_argv(path, bool(body.get("reencode")))
-                title = f"Export {name}"
-                meta = {"project": name}
+                estimating = kind == "export_estimate"
+                argv = commands.export_argv(path, bool(body.get("reencode")), estimating)
+                title = f"{'Estimate' if estimating else 'Export'} {name}"
+                meta = {"project": name, "memory_gb": memory.EXPORT_GB}
             else:
                 raise HTTPException(400, f"Unknown job type: {kind}")
         except ValueError as exc:
@@ -476,16 +620,62 @@ def create_app(output_dir=None, dialogs=None):
             length = None
         return {"path": stored, "duration_sec": length}
 
+    def _fresh_probes(project):
+        """Swap embedded probes older than the probe version for the library's cached ones
+        (probing once when not cached yet); export.ensure_probes covers what is left."""
+        for src in (project.get("sources") or {}).values():
+            if ((src.get("probe") or {}).get("probe_version") or 1) >= probe_mod.PROBE_VERSION:
+                continue
+            known = lib().source_by_path(src["path"])
+            if known and known["exists"]:
+                try:
+                    src["probe"] = library_mod.probe_source(lib().output_dir, known)
+                except RuntimeError:
+                    pass
+        return export_mod.ensure_probes(project)
+
     @app.get("/api/projects/{name}/plan")
     async def export_plan(name: str):
         project = _project_errors(projects.load, lib().output_dir, name)
         try:
-            p = await asyncio.to_thread(export_mod.plan, project)
+            p = await asyncio.to_thread(lambda: export_mod.plan(_fresh_probes(project)))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
         p["output"] = str(export_mod.output_path(project, projects.path(lib().output_dir, name)))
         p["output_exists"] = os.path.exists(p["output"])
+        p["missing"] = _missing(project)
         return p
+
+    def _missing(project):
+        """Files the export needs that are not there (sources, cleaned sound, music)."""
+        paths = [(src or {}).get("path") for src in (project.get("sources") or {}).values()]
+        tracks = project.get("tracks") or {}
+        paths += [(c.get("audio") or {}).get("file") for c in tracks.get("video") or []]
+        paths += [m.get("file") for m in tracks.get("music") or []]
+        return sorted({p for p in paths if p and not os.path.exists(p)})
+
+    @app.get("/api/projects/{name}/estimate")
+    async def export_estimate(name: str):
+        """The saved size estimate (export/estimate.json) and whether the project has
+        changed since: stale when its key no longer matches the saved settings."""
+        from .. import sizing
+        project = _project_errors(projects.load, lib().output_dir, name)
+        path = projects.path(lib().output_dir, name)
+        try:
+            est = json.loads(sizing.estimate_path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"estimate": None, "stale": False}
+
+        def key():
+            s = sizing.with_overrides(export_mod.settings(project))
+            if not s.get("budget"):
+                return None
+            return sizing.estimate_key(_fresh_probes(project), s)
+        try:
+            current = await asyncio.to_thread(key)
+        except (ValueError, KeyError):
+            current = None
+        return {"estimate": est, "stale": current is None or current != est.get("key")}
 
     # -------------------------------------------------------------- editing aids
     def _prep_target(source_id, kind):
@@ -520,6 +710,20 @@ def create_app(output_dir=None, dialogs=None):
         return FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
 
     # -------------------------------------------------------------- media
+    def _still_wanted(request):
+        async def wanted():
+            return not await request.is_disconnected()
+        return wanted
+
+    def _frame_input(src, width):
+        """Small frames come from the light editing copy when there is one: same timing,
+        ~80 MB and a twentieth of a second to decode against ~0.5 GB for a 4K original."""
+        if width <= 320:
+            proxy = prep.targets(library_mod.prep_cache(lib().output_dir), src["id"])["proxy"]
+            if proxy.is_file():
+                return str(proxy)
+        return src["path"]
+
     @app.get("/media/file")
     def media_file(path: str):
         if state["library"] is None or not lib().allowed(path) or not os.path.isfile(path):
@@ -527,7 +731,7 @@ def create_app(output_dir=None, dialogs=None):
         return FileResponse(path)
 
     @app.get("/media/poster")
-    async def media_poster(source: str, i: int = Query(0, ge=0), n: int = media.POSTER_FRAMES):
+    async def media_poster(request: Request, source: str, i: int = Query(0, ge=0), n: int = media.POSTER_FRAMES):
         if n not in media.POSTER_SETS or i >= n:
             raise HTTPException(422, f"n must be one of {sorted(media.POSTER_SETS)} and i below n")
         src = _source(source)
@@ -542,14 +746,18 @@ def create_app(output_dir=None, dialogs=None):
             raise HTTPException(404, "The source has no picture")
         try:
             path = await media.poster(lib().output_dir, src["path"], src["id"], i,
-                                      probe.get("duration_sec"), n)
+                                      probe.get("duration_sec"), n, wanted=_still_wanted(request))
+        except media.Abandoned:
+            raise HTTPException(499, "The request was dropped")
+        except media.Busy as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": "5"})
         except RuntimeError as exc:
             raise HTTPException(500, str(exc))
         return FileResponse(path, media_type="image/jpeg",
                             headers={"Cache-Control": "private, max-age=86400"})
 
     @app.get("/media/frame")
-    async def media_frame(source: str, t: float = Query(0.0, ge=0), w: int = media.FRAME_WIDTHS[0]):
+    async def media_frame(request: Request, source: str, t: float = Query(0.0, ge=0), w: int = media.FRAME_WIDTHS[0]):
         if w not in media.FRAME_WIDTHS:
             raise HTTPException(422, f"w must be one of {list(media.FRAME_WIDTHS)}")
         src = _source(source)
@@ -565,7 +773,12 @@ def create_app(output_dir=None, dialogs=None):
         duration = probe.get("duration_sec") or 0.0
         at = min(t, max(0.0, duration - 0.2))      # a frame exists just before the end
         try:
-            path = await media.frame(lib().output_dir, src["path"], src["id"], at, w)
+            path = await media.frame(lib().output_dir, _frame_input(src, w), src["id"], at, w,
+                                     wanted=_still_wanted(request))
+        except media.Abandoned:
+            raise HTTPException(499, "The request was dropped")
+        except media.Busy as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": "5"})
         except RuntimeError as exc:
             raise HTTPException(500, str(exc))
         return FileResponse(path, media_type="image/jpeg",
@@ -578,19 +791,24 @@ def create_app(output_dir=None, dialogs=None):
         out_dir = lib().output_dir
         try:
             if kind in ("output", "original_for"):
+                # With a duration: only that stretch (start counted from the window's
+                # start), for comparing long outputs a section at a time.
                 out = lib().output(file or "")
                 if out is None or not out["exists"]:
                     raise HTTPException(404, "Unknown output")
+                section = duration is not None
                 if kind == "output":
-                    path = await media.output_audio(out_dir, out["path"])
+                    path = (await media.output_audio_section(out_dir, out["path"], start, duration)
+                            if section else await media.output_audio(out_dir, out["path"]))
                 else:
                     window = out.get("window") or {}
                     src = lib().source_by_path(out["source_path"] or "")
                     if src is None or not src["exists"]:
                         raise HTTPException(410, "The source file is missing")
-                    path = await media.original_audio(out_dir, src["path"],
-                                                      window.get("actual_start_sec") or 0.0,
-                                                      window.get("actual_duration_sec"))
+                    begin = window.get("actual_start_sec") or 0.0
+                    path = await media.original_audio(
+                        out_dir, src["path"], begin + (start if section else 0.0),
+                        duration if section else window.get("actual_duration_sec"))
             else:
                 src = _source(source or "")
                 path = await media.original_audio(out_dir, src["path"], start, duration)
@@ -607,7 +825,7 @@ def create_app(output_dir=None, dialogs=None):
         index = STATIC / "index.html"
         if index.is_file():
             return FileResponse(index, headers={"Cache-Control": "no-cache"})
-        return HTMLResponse("<h1>Video Audio Cleaner</h1><p>The frontend is not built. Run "
+        return HTMLResponse("<h1>Video Master</h1><p>The frontend is not built. Run "
                             "<code>cd gui &amp;&amp; npm ci &amp;&amp; npm run build</code> "
                             "(or <code>./setup.sh</code>).</p>", status_code=503)
 
