@@ -65,14 +65,20 @@ def _footprint(pid):
 
 
 def _table():
-    """{pid: (ppid, rss_bytes)} for every process."""
-    out = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True,
-                         check=False).stdout
+    """{pid: (ppid, rss_bytes)} for every process. Raises OSError when ps cannot list
+    them (a sandbox), so our_usage() says "unknown" rather than 0 bytes."""
+    r = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True,
+                       check=False)
+    if r.returncode != 0:
+        raise OSError(f"ps failed: {r.stderr.strip()}")
+    out = r.stdout
     table = {}
     for line in out.splitlines():
         parts = line.split()
         if len(parts) == 3:
             table[int(parts[0])] = (int(parts[1]), int(parts[2]) * 1024)
+    if os.getpid() not in table:
+        raise OSError("ps did not list this process")
     return table
 
 

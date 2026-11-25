@@ -156,17 +156,40 @@ def system_prompt(to):
             "names. Do not explain, do not add notes, do not add quotation marks. Keep [unclear] as it is.")
 
 
+def context_around(cues, groups, k, to, inside=None, context=None):
+    """(before, after) for passage k: the two passages before it (with what is already
+    translated of them) and the text of the one after. With inside and context, the
+    video's lines outside the stretch give way to the edit's neighbours (context)."""
+    def usable(pg):
+        return inside is None or all(inside(cues[i]) for i in pg)
+    before = []
+    for pg in groups[max(0, k - 2):k]:
+        if not usable(pg):
+            continue
+        src = " ".join(cues[i]["text"] for i in pg)
+        trs = [((cues[i].get("tr") or {}).get(to) or {}).get("text") for i in pg]
+        before.append({"source": src, "translation": " ".join(t for t in trs if t) or None})
+    nxt = groups[k + 1] if k + 1 < len(groups) else None
+    after = " ".join(cues[i]["text"] for i in nxt) if nxt and usable(nxt) else ""
+    if context is not None:
+        if len(before) < 2:       # the passage is near the start of the stretch
+            before = [b for b in (context.get("before") or []) if b.get("source")][-(2 - len(before)):] + before
+        if not after:
+            after = context.get("after") or ""
+    return before, after
+
+
 def request(cues, idxs, before, after, to, glossary):
     # short ids ("1", "2", …): models copy them back reliably, unlike long random ones
     lines = [{"id": str(k + 1), "text": cues[i]["text"]} for k, i in enumerate(idxs)]
-    text = " ".join(cues[i]["text"] for i in idxs) + " " + " ".join(c["text"] for c in after)
+    text = " ".join(cues[i]["text"] for i in idxs) + " " + after
     gl = [g for g in glossary if (g.get("he") and g["he"] in text) or (g.get("en") and g["en"].lower() in text.lower())]
     return {
         "target": NAMES[to],
         "glossary": gl,
         "context_before_do_not_translate": before,
         "lines": lines,
-        "context_after_do_not_translate": " ".join(c["text"] for c in after),
+        "context_after_do_not_translate": after,
     }
 
 
@@ -225,9 +248,13 @@ def ollama_chat(server, model):
 
 # ------------------------------------------------------------------ the job
 def translate(output_dir, source_id, to, *, start=None, end=None, mode="missing", model="gemma3:27b",
-              replace_edited=False, chat=None, log=print_info):
+              replace_edited=False, context=None, chat=None, log=print_info):
     """Translate the due cues of a document (optionally within [start, end]). chat(system,
-    user, seed) -> reply dict can be given (tests); else our own Ollama is started."""
+    user, seed) -> reply dict can be given (tests); else our own Ollama is started.
+
+    context: what the viewer sees around the stretch in the edit, {"before": [{"source",
+    "translation"}, …], "after": "text"} (the end of the previous clip, the start of the
+    next). Given, it stands in for the video's own lines outside [start, end] as context."""
     doc_file = subs.doc_path(output_dir, source_id)
     doc = subs.load(doc_file)
     cues = sorted(doc.get("cues") or [], key=lambda c: c["start"])
@@ -256,12 +283,7 @@ def translate(output_dir, source_id, to, *, start=None, end=None, mode="missing"
         g_index = {id(g): k for k, g in enumerate(groups)}
         for n, g in enumerate(todo, 1):
             k = g_index[id(g)]
-            before = []
-            for pg in groups[max(0, k - 2):k]:
-                src = " ".join(cues[i]["text"] for i in pg)
-                trs = [((cues[i].get("tr") or {}).get(to) or {}).get("text") for i in pg]
-                before.append({"source": src, "translation": " ".join(t for t in trs if t) or None})
-            after = [cues[i] for i in groups[k + 1]] if k + 1 < len(groups) else []
+            before, after = context_around(cues, groups, k, to, inside if context else None, context)
             req = request(cues, g, before, after, to, glossary)
             result = None
             for attempt in range(3):

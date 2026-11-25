@@ -18,6 +18,21 @@ from ..timeparse import format_time_filename
 
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".wav"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".mts", ".m2ts"}
+def is_video(path):
+    """A file the library may serve as a source: a known video extension, else one ffprobe
+    finds a picture in (tapes come as .mpg, .vob, .dv…). Anything else is refused, so
+    /media/file never serves a document someone registered."""
+    if Path(path).suffix.lower() in VIDEO_EXTENSIONS:
+        return True
+    from .. import probe
+    try:
+        info = probe.probe(str(path))
+        # a still picture probes as one frame: not a video
+        return bool(info.get("video")) and float(info.get("duration_sec") or 0) >= 0.5
+    except Exception:
+        return False
+
+
 _WINDOW = re.compile(r"((?:\d+h)?\d+m\d+s)-((?:\d+h)?\d+m\d+s|end)", re.I)
 
 
@@ -266,8 +281,8 @@ class Library:
             paths += sorted(str(p) for p in Path(folder).iterdir()
                             if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
                             and not p.name.startswith(".") and ".partial" not in p.name)
-        found = [p for p in dict.fromkeys(paths) if os.path.isfile(p)]
-        missing = [p for p in paths if not os.path.isfile(p)]
+        found = [p for p in dict.fromkeys(paths) if os.path.isfile(p) and is_video(p)]
+        missing = [p for p in paths if p not in found]
         if not found:
             raise FileNotFoundError(missing[0] if missing else (folder or ""))
         extra = self.extra_sources()

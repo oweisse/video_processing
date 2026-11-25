@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   // Export settings for one project: keep the original quality, or fit a size (budget,
   // format, picture height, hardware encoder); an Estimate (samples, a job) and Export.
   // Used by Deliver and by the editor's Export dialog (docs/stitch-and-size-budget-plan.md §11).
@@ -83,7 +84,8 @@
   }
   $effect(() => {
     void name;
-    void refresh();
+    // only the project's name: refresh saves first, and a save must not re-run this
+    untrack(() => void refresh());
     return () => clearTimeout(timer);
   });
 
@@ -176,6 +178,10 @@
       <label class="field">Loudness <input type="number" step="1" value={project.export.target_lufs ?? -16}
         onchange={(e) => change((p) => (p.export.target_lufs = num((e.target as HTMLInputElement).value)))} /> LUFS</label>
     </div>
+    <label class="field" title="Measures each clip's sound and turns it up or down (up to 12 dB) toward the loudness above, so clips recorded at different levels play at one volume. Your own Gain on a clip stays on top. Split shots of one recording get one level.">
+      <input type="checkbox" checked={!!project.export.level_clips}
+             onchange={(e) => change((p) => (p.export.level_clips = (e.target as HTMLInputElement).checked))} />
+      Even out loudness between clips</label>
 
     <label class="field"><input type="radio" name="size-{name}" checked={!fit} onchange={() => setFit(false)} />
       <b>Keep the original quality</b></label>

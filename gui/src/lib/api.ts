@@ -121,13 +121,14 @@ export interface StorageRow {
   editing: number;
   tuning: number;
   rendered: number;
+  subtitles: number;
   extra: number;
 }
 
 export interface StorageUsage {
   project: string | null;
   videos: StorageRow[];
-  totals: { original: number; editing: number; tuning: number; rendered: number; extra: number; project_files: number; exported: number };
+  totals: { original: number; editing: number; tuning: number; rendered: number; subtitles: number; extra: number; project_files: number; exported: number };
   trash: number;
 }
 
@@ -139,6 +140,7 @@ export type SubtitleOp =
   | { op: "delete"; id: string }
   | { op: "add"; start: number; end: number; text: string }
   | { op: "clear_tr"; id: string; lang: "en" | "he" }
+  | { op: "flags"; id: string; flags?: string[]; tr?: Partial<Record<"en" | "he", { flags?: string[]; src?: string }>> }
   | { op: "delete_range"; start: number; end: number }
   | { op: "put"; cue: Cue }
   | { op: "cover"; start: number; end: number };
@@ -331,6 +333,8 @@ export const api = {
   subtitlesSetup: (fresh = false) => call<SubtitlesSetup>("GET", `/api/subtitles/setup${fresh ? "?fresh=true" : ""}`),
   glossary: () => call<{ he: string; en: string }[]>("GET", "/api/subtitles/glossary"),
   saveGlossary: (items: { he: string; en: string }[]) => call<{ he: string; en: string }[]>("PUT", "/api/subtitles/glossary", items),
+  projectLevels: (name: string, video: unknown[]) =>
+    call<Record<string, { lufs: number | null; gain_db: number }>>("POST", `/api/projects/${encodeURIComponent(name)}/levels`, { video }),
   projectSubtitles: (name: string) =>
     call<{ completeness: Record<"mixed" | "en" | "he", SubtitleCompleteness> }>("GET", `/api/projects/${encodeURIComponent(name)}/subtitles?lang=all`),
   appInfo: () => call<{ native: boolean; version: string }>("GET", "/api/app"),
@@ -366,7 +370,7 @@ export const api = {
   createProject: (name: string) => call<any>("POST", "/api/projects", { name }),
   getProject: (name: string) => call<any>("GET", `/api/projects/${encodeURIComponent(name)}`),
   saveProject: (name: string, project: object) =>
-    call<{ modified: string }>("PUT", `/api/projects/${encodeURIComponent(name)}`, project),
+    call<{ modified: string; rev: number }>("PUT", `/api/projects/${encodeURIComponent(name)}`, project),
   deleteProject: (name: string) => call("DELETE", `/api/projects/${encodeURIComponent(name)}`),
   addMusic: (name: string, path: string) =>
     call<{ path: string; duration_sec: number | null }>("POST", `/api/projects/${encodeURIComponent(name)}/music`, { path }),

@@ -74,6 +74,7 @@ export interface Project {
     fast?: boolean;
   };
   modified?: string;
+  rev?: number; // the revision on disk (every save adds one)
 }
 
 /** Width once the pixels are square (tape transfers often store 16:15 pixels). */
@@ -508,4 +509,15 @@ export function glideFrame(g: { from: Frame | null; to: Frame | null; sec: numbe
 export function matchFrame(f: Frame | null | undefined, shape: number, from: number, to: number): Frame | null {
   if (!f) return null;
   return frameAt(zoomOf(f, shape, from), f.x + f.w / 2, f.y + f.h / 2, shape, to);
+}
+
+/** Clips with each one's automatic level (export.level_clips) added to its own gain, as
+ * the export hears them (with_levels() in video_audio_cleaner/export.py). */
+export function withLevels(clips: Clip[], levels: Record<string, { gain_db: number }> | null): Clip[] {
+  if (!levels) return clips;
+  return clips.map((c) => {
+    const g = levels[c.id]?.gain_db ?? 0;
+    if (!g || c.audio?.mute) return c;
+    return { ...c, audio: { ...(c.audio ?? {}), gain_db: (c.audio?.gain_db ?? 0) + g } };
+  });
 }

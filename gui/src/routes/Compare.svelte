@@ -6,6 +6,7 @@
   import { ABPlayer } from "../lib/abplayer";
   import { audioContext, decode, type Decoded } from "../lib/audio";
   import { links } from "../lib/router.svelte";
+  import { musicChoice } from "../lib/music";
   import { findOutput, reportError, store } from "../lib/state.svelte";
   import { formatClock } from "../lib/time";
   import { followClock } from "../lib/videosync";
@@ -214,7 +215,7 @@
             {#if source}
               <a href={links.newRun({ source: source.id, start: output.window?.requested_start_sec ?? 0,
                   duration: output.window?.requested_duration_sec ?? "", kind: output.params?.source ?? source.source_kind ?? "",
-                  music: output.params?.separate_music ? 1 : "" })}><button>Re-run…</button></a>
+                  music: musicChoice(output.params) })}><button>Re-run…</button></a>
             {/if}
             <button onclick={() => api.reveal(output.path).catch(reportError)}>Reveal</button>
           </div>

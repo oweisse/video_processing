@@ -2,6 +2,8 @@
 
 The file format is export.py's; the GUI edits it and clean-audio-export renders it.
 """
+import fcntl
+import filecmp
 import json
 import os
 import re
@@ -58,15 +60,36 @@ def validate(project):
     export.clips(project)        # raises on impossible clips
 
 
-def save(output_dir, name, project):
+class Conflict(Exception):
+    """The project changed since the copy being saved was loaded (another tab, or the
+    server pointing clips away from a deleted version). .current: the project now."""
+
+    def __init__(self, current):
+        super().__init__("The project was changed elsewhere")
+        self.current = current
+
+
+def save(output_dir, name, project, expect_rev=None):
+    """Write the project, one writer at a time. Every save adds one to its "rev"; with
+    expect_rev (the rev the editor loaded), a project changed since raises Conflict."""
     validate(project)
-    project["name"] = check_name(name)
-    project["modified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     p = path(output_dir, name)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name("project.json.partial")
-    tmp.write_text(json.dumps(project, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    with open(p.with_name(".project.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current = json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+        except ValueError:
+            current = None
+        rev = int((current or {}).get("rev") or 0)
+        if expect_rev is not None and current is not None and int(expect_rev) != rev:
+            raise Conflict(current)
+        project["name"] = check_name(name)
+        project["modified"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        project["rev"] = rev + 1
+        tmp = p.with_name("project.json.partial")
+        tmp.write_text(json.dumps(project, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, p)
     return project
 
 
@@ -103,7 +126,12 @@ def add_music(output_dir, name, source):
         raise FileNotFoundError(str(source))
     folder = path(output_dir, name).parent / "music"
     folder.mkdir(exist_ok=True)
-    dst = folder / source.name
+    # The same song again reuses its copy; a different song with the same name gets
+    # "name_2.mp3", "name_3.mp3"… so it never plays the first one's sound.
+    dst, n = folder / source.name, 1
+    while dst.exists() and not filecmp.cmp(source, dst, shallow=False):
+        n += 1
+        dst = folder / f"{source.stem}_{n}{source.suffix}"
     if not dst.exists():
         shutil.copy2(source, dst)
     return str(dst)

@@ -1,5 +1,15 @@
 # Video Processing Tools
 
+## Start the web UI
+
+```bash
+cd /Users/ofir/git/video_processing
+./venv/bin/clean-audio-gui --browser --port 8787 --output_dir /Users/ofir/Documents/video_processing_output
+```
+
+Then browse to **http://127.0.0.1:8787/** (`--browser` opens it for you; `--no-open` only
+starts the server; with neither, it opens in its own app window). Stop it with Ctrl+C.
+
 Two independent tools:
 
 1. **`clean-audio`** — extracts a time window of audio from a video, cleans it, and merges it back.

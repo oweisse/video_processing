@@ -640,6 +640,12 @@ fold `h` into the 2 s preload lead.
 
 ## 8. Even loudness between clips (`export.level_clips`)
 
+> Built (2026-11-22) as below, with two changes: back-to-back pieces of one recording (same
+> video, same sound, no gap: a split shot) are measured together and get one gain, so a
+> split never jumps; and the editor sends its current clips (`POST /api/projects/{name}/levels`)
+> instead of the endpoint reading the saved file. The levelling is in `export.level()`,
+> used by both `export.run()` and the budgeted `sizing.run()`.
+
 Cleaned outputs are each at the target (−16 LUFS) over *their whole window*; a clip may
 be a part of one, and original-sound clips are wherever the tape was. With
 `export.level_clips: true`:

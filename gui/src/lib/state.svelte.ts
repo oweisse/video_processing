@@ -73,6 +73,14 @@ function upsert(job: Job | { id: string; removed: true }) {
   }
 }
 
+// A project changed on disk (saved by another tab, or clips pointed away from a deleted
+// or renamed version): open editors reload or re-apply their own edits on top.
+const projectListeners = new Set<(e: { name: string; rev: number }) => void>();
+export function onProjectChange(fn: (e: { name: string; rev: number }) => void) {
+  projectListeners.add(fn);
+  return () => projectListeners.delete(fn);
+}
+
 let source: EventSource | null = null;
 export function connectEvents() {
   source?.close();
@@ -82,6 +90,10 @@ export function connectEvents() {
     void loadJobs();
   });
   source.addEventListener("job", (ev) => upsert(JSON.parse((ev as MessageEvent).data)));
+  source.addEventListener("project", (ev) => {
+    const e = JSON.parse((ev as MessageEvent).data);
+    projectListeners.forEach((f) => f(e));
+  });
   source.addEventListener("error", () => {
     store.connected = false;
   });

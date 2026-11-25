@@ -84,6 +84,19 @@ def test_overrides_and_defaults():
         sizing.with_overrides({**E.DEFAULT_EXPORT, "codec": "av1"})
 
 
+def test_subtitle_flags_change_only_what_they_name():
+    flags = lambda *a: E.overrides_of(E.build_parser().parse_args(["p.json", *a]))["subtitles"]
+    assert flags("--subtitles_srt", "mixed,en") == {"srt": ["mixed", "en"]}
+    assert flags("--subtitle_tracks", "none") == {"tracks": []}
+    assert flags() is None
+    saved = {**E.DEFAULT_EXPORT, "subtitles": {"srt": ["he"], "tracks": ["mixed", "he"], "default_track": "he"}}
+    s = sizing.with_overrides(saved, {"subtitles": {"srt": ["mixed", "en"]}})
+    assert s["subtitles"] == {"srt": ["mixed", "en"], "tracks": ["mixed", "he"], "default_track": "he"}
+    s = sizing.with_overrides(saved, {"subtitles": {"tracks": []}})
+    assert s["subtitles"]["srt"] == ["he"] and s["subtitles"]["tracks"] == []
+    assert sizing.with_overrides(saved, {"subtitles": None})["subtitles"] == saved["subtitles"]
+
+
 def test_output_canvas_scales_down_only():
     cv = {"width": 3840, "height": 2160, "fps": 30}
     assert sizing.output_canvas(cv, 1080) == {"width": 1920, "height": 1080, "fps": 30}

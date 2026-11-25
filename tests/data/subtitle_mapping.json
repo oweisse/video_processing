@@ -326,6 +326,54 @@
      "c4"
     ]
    ]
+  },
+  {
+   "name": "a crossfade longer than half a short clip is shortened",
+   "clips": [
+    {
+     "id": "a",
+     "source": "s",
+     "in_sec": 10,
+     "out_sec": 20
+    },
+    {
+     "id": "b",
+     "source": "s",
+     "in_sec": 40,
+     "out_sec": 42.5,
+     "transition_in": {
+      "type": "crossfade",
+      "sec": 3
+     }
+    },
+    {
+     "id": "c",
+     "source": "t",
+     "in_sec": 4,
+     "out_sec": 8
+    }
+   ],
+   "lang": "mixed",
+   "expect": [
+    [
+     2.0,
+     4.0,
+     "שלום everyone",
+     "c1"
+    ],
+    [
+     9.75,
+     11.25,
+     "hello there",
+     "c3"
+    ],
+    [
+     12.25,
+     14.25,
+     "another video",
+     "d1"
+    ]
+   ]
   }
  ]
 }

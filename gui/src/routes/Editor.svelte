@@ -3,7 +3,7 @@
   // them on the timeline, lay music under them, export one MP4.
   import { onDestroy, untrack } from "svelte";
   import { ltr } from "../lib/bidi";
-  import { api, media, type Output, type Source } from "../lib/api";
+  import { api, ApiError, media, type Output, type Source } from "../lib/api";
   import ExportDialog from "../edit/ExportDialog.svelte";
   import { audioContext } from "../lib/audio";
   import { STREAM_AFTER } from "../lib/voices";
@@ -25,22 +25,27 @@
   import { cleanStretches, clipStretch, type BatchRow } from "../edit/cleanclips";
   import { awaiting, await_, forget } from "../edit/awaiting.svelte";
   import {
-    audioFor, coveringOutput, coveringOutputs, glideFrame, matchFrame, sameFrame, zoomGlide, zoomJoin, ZOOM_GLIDE_CHOICES, ZOOM_GLIDE_SEC, displayWidth, suggestCanvas, zoomOf, duration as editDuration, joinsOf, newId, place, clipAt, split,
+    audioFor, coveringOutput, coveringOutputs, glideFrame, matchFrame, sameFrame, zoomGlide, zoomJoin, ZOOM_GLIDE_CHOICES, ZOOM_GLIDE_SEC, displayWidth, suggestCanvas, zoomOf, duration as editDuration, joinsOf, newId, place, clipAt, split, withLevels,
     type Clip, type Join, type JoinInfo, type MusicClip, type Project,
   } from "../lib/edit";
   import { Program } from "../lib/program";
   import { href } from "../lib/router.svelte";
   import { loadPref, savePref } from "../lib/prefs";
-  import { findOutput, loadLibrary, nativePick, reportError, store, toast, queued } from "../lib/state.svelte";
+  import { findOutput, loadLibrary, nativePick, onProjectChange, reportError, store, toast, queued } from "../lib/state.svelte";
   import { formatClock, formatDuration } from "../lib/time";
   import FolderBrowser from "../components/FolderBrowser.svelte";
   import Timeline, { type Selection, type ThumbInfo } from "../components/Timeline.svelte";
 
   let { name }: { name: string } = $props();
 
+  // What you were looking at, per project, so a reload comes back to it: the Resulting
+  // video's position, the Source viewer's video and position, the selected clip.
+  type View = { time?: number; srcId?: string; srcTime?: number; selected?: Selection };
+  const savedView = untrack(() => loadPref<View>(`edit.view.${name}`, {}));
+
   let project = $state<Project | null>(null);
   let error = $state<string | null>(null);
-  let selected = $state<Selection>(null);
+  let selected = $state<Selection>(savedView.selected ?? null);
   let pps = $state(20);
   let time = $state(0);
   let playing = $state(false);
@@ -50,26 +55,89 @@
   let historyTick = $state(0);
 
   // ---------------------------------------------------------------- loading and saving
-  // svelte-ignore state_referenced_locally
-  api.getProject(name).then((p) => (project = p)).catch((e) => (error = e.message));
-
+  // The project on disk has a revision ("rev"); a save says which one it builds on, and
+  // the server refuses one made from an older copy (409) instead of overwriting what
+  // changed since: another tab, or clips the server pointed away from a deleted or
+  // renamed cleaned version. Then the newer project is loaded and the edits not saved
+  // yet are applied again on top of it.
+  let rev = 0;
+  let unsaved: ((p: Project) => void)[] | null = []; // null: an undo/redo, cannot be re-applied
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let busy = false; // a save on its way
+  let chain: Promise<void> = Promise.resolve();
+  // svelte-ignore state_referenced_locally
+  api.getProject(name).then((p) => { rev = p.rev ?? 0; project = p; }).catch((e) => (error = e.message));
+
   function scheduleSave() {
     saving = "saving";
     clearTimeout(saveTimer);
     saveTimer = setTimeout(flush, 600);
   }
-  async function flush() {
+  /** Save now (saves run one after another, each on the revision the last one made). */
+  function flush(): Promise<void> {
     clearTimeout(saveTimer);
+    saveTimer = undefined;
+    chain = chain.then(saveNow, saveNow);
+    return chain;
+  }
+  async function saveNow() {
     if (!project) return;
+    if (unsaved !== null && !unsaved.length) {
+      if (!saveTimer && saving === "saving") saving = "saved";
+      return; // nothing changed since the last save
+    }
+    const sent = unsaved;
+    unsaved = [];
+    busy = true;
     try {
-      await api.saveProject(name, $state.snapshot(project));
-      saving = "saved";
+      const r = await api.saveProject(name, { ...$state.snapshot(project), rev });
+      rev = r.rev;
+      if (!saveTimer) saving = "saved";
     } catch (e) {
-      saving = "error";
-      reportError(e);
+      if (e instanceof ApiError && e.status === 409) {
+        try {
+          rebase(await api.getProject(name), sent === null || unsaved === null ? null : [...sent, ...unsaved]);
+        } catch (e2) {
+          saving = "error";
+          reportError(e2);
+        }
+      } else {
+        unsaved = sent === null || unsaved === null ? null : [...sent, ...unsaved];
+        saving = "error";
+        reportError(e);
+      }
+    } finally {
+      busy = false;
     }
   }
+  /** The project changed elsewhere: take it, and apply our edits not saved yet on top. */
+  function rebase(latest: Project, edits: ((p: Project) => void)[] | null) {
+    rev = latest.rev ?? 0;
+    if (edits === null) {
+      project = latest;
+      unsaved = [];
+      saving = "saved";
+      toast("This project was changed in another place, so it was reloaded. Your last change (an undo or redo) could not be kept: please do it again.", "error");
+      return;
+    }
+    const next = JSON.parse(JSON.stringify(latest)) as Project;
+    for (const m of edits) m(next);
+    project = next;
+    historyTick++;
+    unsaved = [...edits];
+    if (edits.length) scheduleSave();
+    else saving = "saved";
+    toast("This project was changed in another place (a cleaned version deleted or renamed, or another tab): it was reloaded" +
+      (edits.length ? ", with your newest edits kept on top." : "."));
+  }
+  // Changed elsewhere while nothing of ours is waiting: just reload. (With edits waiting,
+  // their save meets the 409 and rebases.)
+  onDestroy(onProjectChange((e) => {
+    if (e.name !== name || e.rev <= rev || busy || saveTimer) return;
+    api.getProject(name).then((latest) => {
+      if ((latest.rev ?? 0) > rev && !busy && !saveTimer && unsaved?.length === 0) rebase(latest, []);
+    }).catch(() => {});
+  }));
 
   function commit(mutate: (p: Project) => void) {
     if (!project) return;
@@ -77,6 +145,7 @@
     const next = JSON.parse(before) as Project;
     mutate(next);
     if (JSON.stringify(next) === before) return;
+    unsaved?.push(mutate);
     undo.push(before);
     if (undo.length > 200) undo.shift();
     redo.length = 0;
@@ -89,6 +158,7 @@
     if (!prev || !project) return;
     redo.push(JSON.stringify($state.snapshot(project)));
     project = JSON.parse(prev);
+    unsaved = null;
     historyTick++;
     scheduleSave();
   }
@@ -97,6 +167,7 @@
     if (!next || !project) return;
     undo.push(JSON.stringify($state.snapshot(project)));
     project = JSON.parse(next);
+    unsaved = null;
     historyTick++;
     scheduleSave();
   }
@@ -179,11 +250,39 @@
     program?.dispose();
     void flush();
   });
+  // Even loudness between clips (export.level_clips): each clip's automatic level, measured
+  // by the server (cached beside the project) a second after the sound of the edit
+  // changes, and heard in the preview as the export will have it.
+  let levels = $state<Record<string, { lufs: number | null; gain_db: number }> | null>(null);
+  const levelKey = $derived(project?.export.level_clips
+    ? JSON.stringify(project.tracks.video.map((c) => [c.id, c.source, c.in_sec, c.out_sec, c.audio?.file ?? null, c.audio?.start_sec ?? null, !!c.audio?.mute]))
+    : "");
+  $effect(() => {
+    const key = levelKey;
+    if (!key || !project) { levels = null; return; }
+    const video = $state.snapshot(project.tracks.video);
+    const t = setTimeout(() => {
+      api.projectLevels(name, video).then((l) => { if (key === levelKey) levels = l; }).catch(() => (levels = null));
+    }, 1000);
+    return () => clearTimeout(t);
+  });
   $effect(() => {
     if (!project || !program) return;
     const snap = $state.snapshot(project.tracks) as Project["tracks"];
-    void program.setEdit(snap.video, snap.music);
+    const pr = program;
+    void pr.setEdit(withLevels(snap.video, project.export.level_clips ? levels : null), snap.music).then(() => {
+      if (viewRestored) return;
+      viewRestored = true;
+      if (savedView.time) pr.seek(savedView.time);
+    });
   });
+  let viewRestored = false;
+  function saveView() {
+    if (!project || !viewRestored) return; // nothing to keep yet (and never overwrite it with 0)
+    savePref(`edit.view.${name}`, { time, srcId, srcTime, selected } satisfies View);
+  }
+  const viewTimer = setInterval(saveView, 2000);
+  onDestroy(() => { clearInterval(viewTimer); saveView(); });
 
   const total = $derived(project ? editDuration(project.tracks.video) : 0);
   // ---------------------------------------------------------------- subtitles (docs/subtitles-plan.md §7)
@@ -265,13 +364,35 @@
       stretches: st.map((x) => ({ source: x.source, sourceName: sourceName(x.source), start: x.start, end: x.end, clips: x.clips })),
     };
   }
+  /** What the viewer sees around clips that follow each other on the timeline: the last
+   *  lines of the clip before (with their translations) and the first lines of the clip
+   *  after. The translator reads them as context, so a clip is not translated in a void. */
+  function editContext(ids: string[], to: "en" | "he") {
+    if (!project) return null;
+    const video = project.tracks.video;
+    const at = ids.map((id) => video.findIndex((c) => c.id === id)).filter((i) => i >= 0).sort((a, b) => a - b);
+    if (!at.length || at[at.length - 1] - at[0] !== at.length - 1) return null; // not one run of clips
+    const lines = timelineCues(video, subtitles.docs, "mixed");
+    const prev = video[at[0] - 1], next = video[at[at.length - 1] + 1];
+    const tail = (prev ? lines.filter((l) => l.clip === prev.id) : []).slice(-4);
+    const head = (next ? lines.filter((l) => l.clip === next.id) : []).slice(0, 4);
+    const trOf = (l: { source: string; cue: string }) => {
+      const c = subtitles.docs[l.source]?.cues.find((x) => x.id === l.cue);
+      return c?.lang === to ? c.text : c?.tr?.[to]?.text ?? null;
+    };
+    const before = tail.length ? [{ source: tail.map((l) => l.text).join(" "),
+                                    translation: tail.every((l) => trOf(l)) ? tail.map(trOf).join(" ") : null }] : [];
+    const after = head.map((l) => l.text).join(" ");
+    return before.length || after ? { before, after } : null;
+  }
   async function translateClips(cs: Clip[], to: "en" | "he", mode: "missing" | "stale" | "all") {
     showSubMenu = false;
     if (await needSetup("translate")) return;
     const st = cleanStretches(cs, (sid) => sourceById(sid)?.probe?.duration_sec ?? Infinity, 0);
     try {
       for (const x of st) {
-        await api.submit({ type: "subtitles_translate", source_id: x.source, to, mode, start_sec: x.start, duration_sec: x.end - x.start });
+        await api.submit({ type: "subtitles_translate", source_id: x.source, to, mode, start_sec: x.start,
+                           duration_sec: x.end - x.start, context: editContext(x.clips, to) });
       }
       toast(`Translating into ${to === "en" ? "English" : "Hebrew"}. Lines appear in the Subtitles tab as they are done.`);
     } catch (e) {
@@ -336,13 +457,14 @@
   const fps = $derived(project?.canvas?.fps ?? 30);
 
   // ---------------------------------------------------------------- source viewer
-  let srcId = $state("");
+  let srcId = $state(savedView.srcId ?? "");
   $effect(() => {
+    if (srcId && sources.length && !sourceById(srcId)) srcId = ""; // the saved one is gone
     if (!srcId && sources.length) srcId = (project && Object.keys(project.sources)[0]) || sources[0].id;
   });
   const src = $derived(sourceById(srcId));
   let srcVideo = $state<HTMLVideoElement | null>(null);
-  let srcTime = $state(0);
+  let srcTime = $state(savedView.srcTime ?? 0);
   let srcPlaying = $state(false);
   let markIn = $state<number | null>(null);
   // The viewer the transport keys (Space, J/K/L, arrows) drive: the last one clicked, or the
@@ -425,7 +547,7 @@
     hearing = p.output.file;
   }
   // A seek asked for before the newly chosen video has loaded.
-  let pendingSeek: number | null = null;
+  let pendingSeek: number | null = savedView.srcId && savedView.srcTime ? savedView.srcTime : null;
   function seekSource(id: string, t: number) {
     active = "source";
     const switching = id !== srcId;
@@ -890,7 +1012,7 @@
   const num = (v: string) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 </script>
 
-<svelte:window onkeydown={keydown} />
+<svelte:window onkeydown={keydown} onpagehide={saveView} />
 
 <div class="page col editor" style:--pinned-h="{viewersH + 10}px">
   {#if error}
@@ -1140,6 +1262,11 @@
             </select></label>
           <label class="field">Gain <input type="number" step="0.5" value={c.audio?.gain_db ?? 0} disabled={c.audio?.mute}
             onchange={(e) => updateClip(c.id, (x) => (x.audio = { ...(x.audio ?? {}), gain_db: num((e.target as HTMLInputElement).value) }))} /> dB</label>
+          {#if project.export.level_clips && levels?.[c.id] && !c.audio?.mute}
+            {@const lv = levels[c.id]}
+            <span class="small faint" title={lv.lufs === null ? "Too short or too quiet to measure: left as it is" : `Measured ${lv.lufs.toFixed(1)} LUFS; turned toward ${project.export.target_lufs ?? -16} LUFS (Export settings: Even out loudness between clips)`}>
+              Auto level {lv.gain_db > 0 ? "+" : ""}{lv.gain_db.toFixed(1)} dB</span>
+          {/if}
           <button class="small" onclick={() => (framing = c.id)} disabled={!sourceById(c.source)?.probe?.video}
                   title="Zoom in: choose the part of the picture this clip shows">
             {c.frame ? `Zoom ${Math.round(zoomOf(c.frame, outShape, pictureOf(c.source)) * 100)}%…` : "Zoom…"}</button>

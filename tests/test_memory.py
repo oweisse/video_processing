@@ -35,6 +35,9 @@ def test_clean_estimate_grows_with_the_stretch():
 
 
 def test_usage_counts_our_children():
+    memory.forget_usage()
+    if memory.our_usage() is None:
+        pytest.skip("ps cannot list processes here")
     before = memory.usage_of(memory.tree())
     child = subprocess.Popen([sys.executable, "-c",
                               "b = bytearray(400 * 2**20)\nimport time; time.sleep(5)"])
@@ -46,3 +49,12 @@ def test_usage_counts_our_children():
     finally:
         child.kill()
         child.wait()
+
+
+def test_usage_is_unknown_when_ps_fails(monkeypatch):
+    def fail(*a, **k):
+        return subprocess.CompletedProcess(a, 1, "", "operation not permitted")
+    monkeypatch.setattr(memory.subprocess, "run", fail)
+    memory.forget_usage()
+    assert memory.our_usage() is None
+    memory.forget_usage()

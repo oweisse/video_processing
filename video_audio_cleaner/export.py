@@ -60,7 +60,9 @@ def clips(project):
         length = float(c["out_sec"]) - float(c["in_sec"])
         if length <= 0:
             raise ProjectError(f"clip {c.get('id', i)} ends before it starts")
-        fade = transition(c) if i else 0.0
+        # A crossfade takes at most half of either clip, as in video_graph(), joins()
+        # and place() in gui/src/lib/edit.ts.
+        fade = min(transition(c), out[-1][2] / 2, length / 2) if i else 0.0
         t -= fade
         out.append((c, t, length))
         t += length
@@ -833,10 +835,14 @@ def output_path(project, project_path):
 
 
 def check_files(project):
+    """Every file the export reads (videos, clip sound, music) exists, else ProjectError."""
+    need = []
     for c, _, _ in clips(project):
-        for path in (source_of(project, c)["path"], (c.get("audio") or {}).get("file")):
-            if path and not os.path.exists(path):
-                raise ProjectError(f"missing file: {path}")
+        need += [source_of(project, c)["path"], (c.get("audio") or {}).get("file")]
+    need += [m.get("file") for m in project.get("tracks", {}).get("music") or ()]
+    for path in need:
+        if path and not os.path.exists(path):
+            raise ProjectError(f"missing file: {path}")
 
 
 def run(project_path, out=None, force_encode=False, overrides=None):
@@ -849,7 +855,7 @@ def run(project_path, out=None, force_encode=False, overrides=None):
     check_files(project)
     if s.get("budget"):
         return sizing.run(project_path, project, s, out, force_encode)
-    total_steps = 3
+    total_steps = 4 if s.get("level_clips") else 3
     print_step(1, total_steps, "Checking the cuts")
     p = plan(project)
     if force_encode and p["mode"] == "copy":
@@ -866,7 +872,12 @@ def run(project_path, out=None, force_encode=False, overrides=None):
     else:
         print_info("Re-encoding the video: " + "; ".join(p["reasons"]) + ".")
 
-    print_step(2, total_steps, "Measuring loudness")
+    step = 2
+    if s.get("level_clips"):
+        print_step(step, total_steps, "Levelling the clips")
+        project = level(project, project_path, s)
+        step += 1
+    print_step(step, total_steps, "Measuring loudness")
     measured = measure(project, s, total)
 
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -877,10 +888,10 @@ def run(project_path, out=None, force_encode=False, overrides=None):
     try:
         verified = None
         if p["mode"] == "copy":
-            print_step(3, total_steps, "Writing (video copied, audio encoded)")
+            print_step(total_steps, total_steps, "Writing (video copied, audio encoded)")
             commands, verified, p = write_copy(project, s, partial, measured, work, p)
         if p["mode"] == "encode":
-            print_step(3, total_steps, f"Encoding {p['canvas']['width']}×"
+            print_step(total_steps, total_steps, f"Encoding {p['canvas']['width']}×"
                                        f"{p['canvas']['height']} ({encoder_name(s)})")
             cmd = encode_command(project, s, partial, measured, p["canvas"])
             ffmpeg_utils.run_ffmpeg(cmd, total, "Encoding")
@@ -900,6 +911,138 @@ def run(project_path, out=None, force_encode=False, overrides=None):
         result["subtitles"] = subtitle_result(subtitle_info, write_subtitle_files(out, subtitle_info))
     finish(out, project_path, project, commands, result)
     return out, result
+
+
+# ------------------------------------------------------------------ even loudness between clips
+# docs/stitch-and-size-budget-plan.md §8: with export.level_clips, each clip's sound is
+# measured (integrated LUFS, ebur128) and turned up or down toward the target, on top of
+# the user's own gain. Back-to-back pieces of one recording (a split shot: same video,
+# same sound, no gap) are measured together and get one gain, so a split never jumps.
+LEVEL_RANGE_DB = 12.0
+LEVEL_MIN_SEC = 3.0
+LEVEL_SILENT_LUFS = -50.0
+
+
+def level_groups(project):
+    """[[clip index, …], …]: runs of clips that are one recording, in timeline order."""
+    groups = []
+    vs = project.get("tracks", {}).get("video", [])
+    for i, c in enumerate(vs):
+        prev = vs[i - 1] if i else None
+        if (prev is not None and groups and _sound(c) != "mute" and _sound(prev) == _sound(c)
+                and prev["source"] == c["source"]
+                and abs(float(prev["out_sec"]) - float(c["in_sec"])) < 0.02):
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    return groups
+
+
+def _heard(project, clips_):
+    """(path, start, length) of the sound a run of clips plays, or None when muted."""
+    first, last = clips_[0], clips_[-1]
+    audio = first.get("audio") or {}
+    if audio.get("mute"):
+        return None
+    start, length = float(first["in_sec"]), float(last["out_sec"]) - float(first["in_sec"])
+    if audio.get("file"):
+        return audio["file"], start - float(audio.get("start_sec") or 0.0), length
+    return source_of(project, first)["path"], start, length
+
+
+def measure_lufs(path, start, length):
+    """Integrated loudness of [start, start + length] of a file's first audio stream."""
+    from .postprocess import parse_ebur128_summary
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{max(0.0, start):.3f}",
+                        "-t", f"{length:.3f}", "-i", path, "-map", "0:a:0", "-af", "ebur128",
+                        "-f", "null", "-"], capture_output=True, text=True, check=False)
+    return parse_ebur128_summary(r.stderr)[0]
+
+
+def _level_key(path, start, length):
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    return f"{os.path.abspath(path)}|{mtime:.0f}|{start:.2f}|{length:.2f}"
+
+
+def clip_levels(project, target_lufs, cache=None, measure=measure_lufs):
+    """{clip id: {"lufs": float | None, "gain_db": float}} for every clip. The gain is
+    target − lufs, within ±LEVEL_RANGE_DB; 0 when muted, shorter than LEVEL_MIN_SEC or near
+    silent. cache: {key: lufs}, read and filled (levels.json beside the project)."""
+    from concurrent.futures import ThreadPoolExecutor
+    cache = {} if cache is None else cache
+    vs = project.get("tracks", {}).get("video", [])
+    groups = [(g, _heard(project, [vs[i] for i in g])) for g in level_groups(project)]
+    todo = {}
+    for _, heard in groups:
+        if heard and heard[2] >= LEVEL_MIN_SEC:
+            key = _level_key(*heard)
+            if key not in cache:
+                todo[key] = heard
+    if todo:
+        with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+            for key, lufs in zip(todo, pool.map(lambda h: measure(*h), todo.values())):
+                cache[key] = lufs
+    out = {}
+    for g, heard in groups:
+        lufs = cache.get(_level_key(*heard)) if heard and heard[2] >= LEVEL_MIN_SEC else None
+        gain = 0.0
+        if lufs is not None and lufs > LEVEL_SILENT_LUFS:
+            gain = max(-LEVEL_RANGE_DB, min(LEVEL_RANGE_DB, float(target_lufs) - lufs))
+        for i in g:
+            out[vs[i].get("id", str(i))] = {"lufs": None if lufs is None else round(lufs, 2),
+                                            "gain_db": round(gain, 2)}
+    return out
+
+
+def levels_path(project_path):
+    return Path(project_path).with_name("levels.json")
+
+
+def project_levels(project, project_path, target_lufs, measure=measure_lufs):
+    """clip_levels() with the cache beside the project file (kept across exports)."""
+    path = levels_path(project_path) if project_path else None
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8")) if path and path.exists() else {}
+    except (OSError, ValueError):
+        cache = {}
+    before = dict(cache)
+    levels = clip_levels(project, target_lufs, cache, measure)
+    if path and cache != before:
+        try:
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cache, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return levels
+
+
+def with_levels(project, levels):
+    """A copy of the project with each clip's level added to its own gain."""
+    if not levels:
+        return project
+    project = json.loads(json.dumps(project))
+    for i, c in enumerate(project.get("tracks", {}).get("video", [])):
+        lv = levels.get(c.get("id", str(i)))
+        if lv and lv["gain_db"] and not (c.get("audio") or {}).get("mute"):
+            audio = dict(c.get("audio") or {})
+            audio["gain_db"] = float(audio.get("gain_db") or 0.0) + lv["gain_db"]
+            c["audio"] = audio
+    return project
+
+
+def level(project, project_path, s):
+    """The project with even loudness between clips when export.level_clips is on."""
+    if not s.get("level_clips"):
+        return project
+    levels = project_levels(project, project_path, s["target_lufs"])
+    moved = [v["gain_db"] for v in levels.values() if v["gain_db"]]
+    print_info(f"Levelled {len(moved)} of {len(levels)} clips"
+               + (f" ({min(moved):+.1f} to {max(moved):+.1f} dB)." if moved else "."))
+    return with_levels(project, levels)
 
 
 def measure(project, s, total):
@@ -1117,10 +1260,11 @@ def overrides_of(args):
     from . import sizing
     budget = (sizing.parse_budget(args.budget) if args.budget else
               sizing.parse_size(args.size) if args.size else None)
-    subtitles = None
-    if args.subtitles_srt is not None or args.subtitle_tracks is not None:
-        pick = lambda v: [] if v in (None, "none") else [x.strip() for x in v.split(",") if x.strip()]
-        subtitles = {"srt": pick(args.subtitles_srt), "tracks": pick(args.subtitle_tracks)}
+    # Only the flags given: the rest of the project's subtitle settings stay
+    # (sizing.with_overrides merges them).
+    pick = lambda v: [] if v == "none" else [x.strip() for x in v.split(",") if x.strip()]
+    subtitles = {k: pick(v) for k, v in (("srt", args.subtitles_srt), ("tracks", args.subtitle_tracks))
+                 if v is not None} or None
     return {"budget": budget, "codec": args.codec, "height": args.height,
             "fast": args.fast, "one_pass": args.one_pass, "subtitles": subtitles,
             "subtitles_dir": args.subtitles_dir}

@@ -139,7 +139,8 @@ def cmd_transcribe(args):
 def cmd_translate(args):
     from . import translate
     translate.translate(args.output_dir, args.id, args.to, start=args.start, end=args.end, mode=args.mode,
-                        model=args.model, replace_edited=args.replace_edited)
+                        model=args.model, replace_edited=args.replace_edited,
+                        context=json.loads(args.context) if args.context else None)
 
 
 def build_parser():
@@ -172,6 +173,8 @@ def build_parser():
     r.add_argument("--model", default=TRANSLATE_MODEL)
     r.add_argument("--replace_edited", action="store_true",
                    help="With --mode all: also replace translations edited by hand.")
+    r.add_argument("--context", help='JSON {"before": [{"source", "translation"}], "after": "text"}: the '
+                   "lines around the stretch in the edit, used as context instead of the video's own.")
     events.add_argument(r)
     return p
 

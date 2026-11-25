@@ -4,6 +4,7 @@ The GUI never does anything the CLI cannot: every job is one of these argv
 lists, validated against the real parsers before it is queued, and shown to
 the user so it can be copied and run by hand.
 """
+import json
 import sys
 from pathlib import Path
 
@@ -138,6 +139,7 @@ def display(argv):
     import shlex
     names = {"video_audio_cleaner.cli": "clean-audio", "video_audio_cleaner.tune":
              "clean-audio-tune", "video_audio_cleaner.export": "clean-audio-export",
+             "video_audio_cleaner.subtitles_cli": "clean-audio-subtitles",
              "video_audio_cleaner.prep": "python -m video_audio_cleaner.prep"}
     if len(argv) > 2 and argv[1] == "-m" and argv[2] in names:
         argv = [names[argv[2]], *argv[3:]]
@@ -193,7 +195,8 @@ def subtitles_argv(source_path, output_dir, source_id, start, end, replace="miss
     return [PYTHON, "-m", "video_audio_cleaner.subtitles_cli", *args]
 
 
-def translate_argv(output_dir, source_id, to, start=None, end=None, mode="missing", replace_edited=False):
+def translate_argv(output_dir, source_id, to, start=None, end=None, mode="missing", replace_edited=False,
+                   context=None):
     from .. import subtitles_cli
     args = ["translate", "--output_dir", str(output_dir), "--id", source_id, "--to", to, "--mode", mode,
             "--progress", "json"]
@@ -201,6 +204,8 @@ def translate_argv(output_dir, source_id, to, start=None, end=None, mode="missin
         args += ["--start", seconds(start), "--end", seconds(end)]
     if replace_edited:
         args.append("--replace_edited")
+    if context:
+        args += ["--context", json.dumps(context, ensure_ascii=False)]
     _check(subtitles_cli.build_parser(), args)
     return [PYTHON, "-m", "video_audio_cleaner.subtitles_cli", *args]
 

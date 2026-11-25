@@ -441,3 +441,67 @@ def test_subtitles_as_srt_files_and_tracks(fx, fx_probe, tmp_path):
     E.run(write(tmp_path, proj2), out2)
     assert not [s for s in ffprobe(out2, "stream=codec_type")["streams"] if s["codec_type"] == "subtitle"]
     assert not list(tmp_path.glob("plain.*.srt"))
+
+
+# ------------------------------------------------------------------ even loudness (level_clips)
+def _lv_project(clips, **kw):
+    return {"schema": 1, "name": "t", "sources": {"s": {"path": "/v/s.mp4"}, "t": {"path": "/v/t.mp4"}},
+            "tracks": {"video": [{"id": f"c{i}", **c} for i, c in enumerate(clips)], "music": []}, **kw}
+
+
+def test_clip_levels_group_split_shots_and_clamp():
+    p = _lv_project([
+        {"source": "s", "in_sec": 0, "out_sec": 10},                      # one recording,
+        {"source": "s", "in_sec": 10, "out_sec": 20},                     # split in two
+        {"source": "t", "in_sec": 0, "out_sec": 10},                      # very quiet: clamped
+        {"source": "t", "in_sec": 20, "out_sec": 22},                     # too short
+        {"source": "s", "in_sec": 30, "out_sec": 40, "audio": {"mute": True}},
+        {"source": "s", "in_sec": 50, "out_sec": 60, "audio": {"file": "/c.wav", "start_sec": 45}},
+        {"source": "t", "in_sec": 40, "out_sec": 50},                     # silence
+    ])
+    asked = []
+
+    def measure(path, start, length):
+        asked.append((path, start, length))
+        return {("/v/s.mp4", 0): -22.0, ("/v/t.mp4", 0): -40.0, ("/c.wav", 5): -15.0,
+                ("/v/t.mp4", 40): -70.0}[(path, start)]
+
+    cache = {}
+    lv = E.clip_levels(p, -16.0, cache, measure)
+    gains = [lv[f"c{i}"]["gain_db"] for i in range(7)]
+    assert gains == [6.0, 6.0, 12.0, 0.0, 0.0, -1.0, 0.0]
+    assert ("/v/s.mp4", 0.0, 20.0) in asked                  # the split shot measured whole
+    assert len(asked) == 4
+    # a second time comes from the cache
+    E.clip_levels(p, -16.0, cache, lambda *a: pytest.fail("measured again"))
+    # the level adds to the user's own gain
+    p["tracks"]["video"][0]["audio"] = {"gain_db": -2}
+    q = E.with_levels(p, lv)
+    assert q["tracks"]["video"][0]["audio"]["gain_db"] == 4.0
+    assert q["tracks"]["video"][2]["audio"] == {"gain_db": 12.0}
+    assert q["tracks"]["video"][4]["audio"] == {"mute": True}
+    assert p["tracks"]["video"][2].get("audio") is None      # the project itself is untouched
+
+
+def test_level_clips_evens_out_an_export(fx, fx_probe, tmp_path):
+    quiet = tmp_path / "quiet.wav"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(fx.video), "-vn", "-af", "volume=-8dB",
+                    str(quiet)], check=True)
+    clips = [{"in_sec": 0, "out_sec": 8}, {"in_sec": 20, "out_sec": 28,
+                                           "audio": {"file": str(quiet), "start_sec": 0}}]
+
+    def halves(out):
+        a = tmp_path / "a.wav"
+        b = tmp_path / "b.wav"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(out), "-t", "8", str(a)], check=True)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", "8", "-i", str(out), str(b)], check=True)
+        return lufs(a), lufs(b)
+
+    out, _ = E.run(write(tmp_path, project(fx, fx_probe, clips, name="plain")))
+    a, b = halves(out)
+    assert a - b > 6
+    p = project(fx, fx_probe, clips, name="level", export={"level_clips": True})
+    out, _ = E.run(write(tmp_path, p))
+    a, b = halves(out)
+    assert abs(a - b) < 1.5
+    assert (tmp_path / "_projects" / "level" / "levels.json").exists()

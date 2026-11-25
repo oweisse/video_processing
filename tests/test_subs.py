@@ -140,6 +140,20 @@ def test_delete_range_removes_lines_and_coverage():
     assert subs.remove_coverage([[0, 10]], -5, 30) == []
 
 
+def test_delete_range_trims_lines_reaching_in():
+    # a clip's lines deleted: the neighbours' lines that reach into it are cut at its
+    # edges, and one that would be left too short goes
+    doc = {"cues": [subs.make_cue(0, 5.2, "before"), subs.make_cue(6, 8, "inside"),
+                    subs.make_cue(9.5, 14, "after"), subs.make_cue(14.5, 16, "far")],
+           "coverage": [[0, 20]]}
+    subs.apply_op(doc, {"op": "delete_range", "start": 5, "end": 10})
+    assert [(c["text"], c["start"], c["end"]) for c in doc["cues"]] == \
+        [("before", 0, 5), ("after", 10, 14), ("far", 14.5, 16)]
+    doc = {"cues": [subs.make_cue(9.85, 10.25, "short tail")], "coverage": []}
+    subs.apply_op(doc, {"op": "delete_range", "start": 0, "end": 10})
+    assert doc["cues"] == []        # its middle is outside, but 0.25 s would be left: under MIN_TRIMMED
+
+
 def test_put_restores_a_cue_exactly():
     doc = {"cues": [subs.make_cue(1, 3, "a")], "coverage": []}
     gone = subs.make_cue(5, 7, "b")
@@ -148,3 +162,19 @@ def test_put_restores_a_cue_exactly():
     assert doc["cues"][1] == gone
     with pytest.raises(ValueError):
         subs.apply_op(doc, {"op": "put", "cue": {**gone, "id": "other"}})
+
+
+def test_flags_op_clears_and_restores_marks():
+    from video_audio_cleaner import subs as S
+    c = S.make_cue(0, 2, "שלום", flags=["low_confidence"])
+    c["tr"] = {"en": {"text": "Hello", "src": "old", "flags": ["number_changed"]}}
+    doc = {"cues": [c], "source": {}}
+    S.apply_op(doc, {"op": "flags", "id": c["id"], "flags": [],
+                     "tr": {"en": {"flags": [], "src": "שלום"}, "he": {"flags": []}}})
+    got = doc["cues"][0]
+    assert got["flags"] == [] and got["tr"]["en"] == {"text": "Hello", "src": "שלום", "flags": []}
+    assert "he" not in got["tr"]          # no translation is made up
+    S.apply_op(doc, {"op": "flags", "id": c["id"], "flags": ["low_confidence"],
+                     "tr": {"en": {"flags": ["number_changed"], "src": "old"}}})
+    assert doc["cues"][0]["flags"] == ["low_confidence"]
+    assert doc["cues"][0]["tr"]["en"]["src"] == "old"

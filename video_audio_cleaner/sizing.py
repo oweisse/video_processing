@@ -96,7 +96,8 @@ def with_overrides(s, overrides=None):
     s = dict(s)
     for key, value in (overrides or {}).items():
         if value is not None:
-            s[key] = value
+            # subtitles: the given parts on top of the project's ({"srt"} keeps "tracks")
+            s[key] = {**(s.get(key) or {}), **value} if key == "subtitles" else value
     budget = s.get("budget") or None
     if budget and not any(float(budget.get(k) or 0) > 0 for k in ("per_hour_gb", "total_gb")):
         budget = None
@@ -762,7 +763,9 @@ def run(project_path, project, s, out, force_encode=False):
                "the videos are larger than the budget")
         p = {**p, "mode": "encode", "reasons": [why]}
 
-    steps(3, "Measuring loudness")
+    steps(3, "Levelling the clips and measuring loudness" if s.get("level_clips")
+          else "Measuring loudness")
+    project = E.level(project, project_path, s)
     measured = E.measure(project, s, seconds)
 
     out.parent.mkdir(parents=True, exist_ok=True)

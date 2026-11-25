@@ -4,6 +4,7 @@
   import { api, type Output, type Plan, type Source } from "../lib/api";
   import { ltr } from "../lib/bidi";
   import { links } from "../lib/router.svelte";
+  import { musicChoice } from "../lib/music";
   import { loadLibrary, reportError, store, toast } from "../lib/state.svelte";
   import { formatBytes, formatDuration } from "../lib/time";
   import PieceBar from "../enhance/PieceBar.svelte";
@@ -60,7 +61,7 @@
       start: w?.requested_start_sec ?? 0,
       duration: w?.requested_duration_sec ?? "",
       kind: o.params?.source ?? s.source_kind ?? "",
-      music: o.params?.separate_music ? 1 : "",
+      music: musicChoice(o.params),
     });
   }
 

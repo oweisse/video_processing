@@ -287,6 +287,29 @@ def _ffmpeg(*args):
     subprocess.run(["ffmpeg", "-y", "-v", "error", *args], check=True)
 
 
+def _workers():
+    """How many ffmpeg passes run side by side: each audio filter graph uses about one
+    core, so a window's candidates render (and encode) in parallel."""
+    return max(1, min(8, (os.cpu_count() or 2) - 2))
+
+
+def _render_candidate(o, denoised_wav, music_wav, out_wav):
+    """postprocess.render without the progress bar (many run at once); stopped with the
+    job (procs tracks it)."""
+    from . import graph, procs
+    cmd = ["ffmpeg", "-y", "-v", "error", *graph.inputs(o, denoised_wav, music_wav),
+           "-filter_complex", graph.build(o, "render"), "-map", "[out]",
+           "-acodec", "pcm_f32le", "-ar", str(o.sample_rate), out_wav]
+    proc = procs.popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                       errors="replace")
+    try:
+        _, err = proc.communicate()
+    finally:
+        procs.untrack(proc)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=err)
+
+
 def evaluate_window(video, window, grid, separate_music, work, music=None):
     """Render and measure every candidate for one window. Returns (source, candidates).
 
@@ -329,10 +352,12 @@ def evaluate_window(video, window, grid, separate_music, work, music=None):
 
     attens, hisses, declicks = grid
     candidates = []
+    from concurrent.futures import ThreadPoolExecutor
     for atten in attens:
         denoised = os.path.join(work, f"dn_{atten}.wav")
         _quiet(denoise.denoise_file, speech, denoised, atten_lim_db=atten)
         noise = hiss.find_quietest_region(denoised, 1.0)
+        todo = []
         for h in hisses:
             for dc in declicks:
                 c = Candidate(atten=atten, hiss=h, declick=dc, separate_music=separate_music,
@@ -351,18 +376,27 @@ def evaluate_window(video, window, grid, separate_music, work, music=None):
                     else:
                         o.hiss_strength = float(value)
                 o.latency = postprocess.measure_latencies(o)
-                out = os.path.join(work, "cand.wav")
-                _quiet(postprocess.render, o, denoised, music_wav if level is not None else None,
-                       out, window.duration, "r")
-                x, _ = M.load_mono(out)
-                x = x[:len(ref)]
-                c.fidelity = M.speech_fidelity(ref, x, sr)
-                c.speech_to_hiss = M.speech_to_hiss_db(x, sr)
-                c.warble = M.warble(x, sr)
-                c.clicks = M.clicks_per_sec(x, sr)
-                os.replace(out, os.path.join(work, f"cand_{len(candidates)}.wav"))
-                candidates.append(c)
-                yield source, c, candidates
+                todo.append((c, o))
+
+        def one(index, c, o, denoised=denoised):
+            out = os.path.join(work, f"cand_{index}.wav")
+            _render_candidate(o, denoised, music_wav if level is not None else None, out)
+            x, _ = M.load_mono(out)
+            x = x[:len(ref)]
+            c.fidelity = M.speech_fidelity(ref, x, sr)
+            c.speech_to_hiss = M.speech_to_hiss_db(x, sr)
+            c.warble = M.warble(x, sr)
+            c.clicks = M.clicks_per_sec(x, sr)
+            return c
+
+        # This strength's candidates render and are measured side by side; reported in
+        # order as they finish.
+        base = len(candidates)
+        with ThreadPoolExecutor(_workers()) as pool:
+            futures = [pool.submit(one, base + k, c, o) for k, (c, o) in enumerate(todo)]
+            for f in futures:
+                candidates.append(f.result())
+                yield source, candidates[-1], candidates
 
 
 def write_listening_file(work, candidates, picks, out_path):
@@ -422,11 +456,13 @@ def keep_candidate_audio(work, candidates, out_dir, label):
                         "lufs": _encode_measured(os.path.join(work, "raw.wav"),
                                                  str(folder / "source.m4a"))},
              "candidates": []}
-    for i in range(len(candidates)):
-        name = f"cand_{i}.m4a"
-        files["candidates"].append(
-            {"file": name, "lufs": _encode_measured(os.path.join(work, f"cand_{i}.wav"),
-                                                    str(folder / name))})
+    from concurrent.futures import ThreadPoolExecutor
+    names = [f"cand_{i}.m4a" for i in range(len(candidates))]
+    with ThreadPoolExecutor(_workers()) as pool:
+        lufs = list(pool.map(lambda i: _encode_measured(os.path.join(work, f"cand_{i}.wav"),
+                                                        str(folder / names[i])),
+                             range(len(candidates))))
+    files["candidates"] = [{"file": n, "lufs": v} for n, v in zip(names, lufs)]
     return files
 
 

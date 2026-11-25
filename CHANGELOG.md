@@ -4,6 +4,27 @@
 
 **Added**
 
+- Subtitles tab: a line marked for a look (chunk edge, too fast, an out-of-date or
+  doubtful translation…) gets a ✓ **Looked at** button (⌘K in its text) that clears the
+  marks and accepts its translations as they are; with **Needs a look** on, **Mark all N
+  as looked at** clears every listed line. Undo puts the marks back (new `flags` edit).
+  A line already in English (or Hebrew) now has a box in that column too, showing the
+  spoken line; editing it edits the spoken line (it used to be plain text you could not click).
+  **Jump to now playing** scrolls the list to the line playing now, and **Follow playback**
+  (on by default, remembered) keeps it in view while the video plays, pausing for 3 s after
+  you type. Following used to scroll to the wrong place (it measured from the page, not the
+  list), and stopped altogether once a text box had focus.
+  **Delete subtitles…** on a clip also trims the neighbours' lines that reach into it at
+  the clip's edges (they used to stay, still showing on the clip); a line left shorter
+  than 0.3 s goes. Undo puts them back as they were.
+  **This clip** in the Subtitles tab moves on with the playhead: playing into the next
+  clip (or seeking to another) shows that clip's lines; selecting a clip shows its lines.
+  The button names the clip ("Clip 13").
+- Translating a clip (**Create English/Hebrew only**, **Update**, and the "for all" menu,
+  per run of neighbouring clips) gives the translator what the viewer sees around it:
+  the last lines of the clip before on the timeline (with their translation) and the first
+  lines of the clip after, in place of the video's own lines outside the clip
+  (`clean-audio-subtitles translate --context`).
 - Edit: deleting a clip or music asks first (with the clip's number, video and times).
   **Delete subtitles…** in the clip panel removes just that clip's subtitle lines and
   their translations (the clip stays); Undo in the Subtitles tab puts deleted lines back
@@ -294,6 +315,48 @@
   (Media and Enhance details, the editor).
 - `/media/poster` takes `n=12` for the hover-scrub frames; new `/media/frame` for a
   frame at any time; the library lists exports.
+
+**Added** (from the code review in carbon_review.md)
+
+- Export: **Even out loudness between clips** (Deliver's export settings; on for new
+  stitched timelines) now works. Each clip's sound is measured (ebur128, in parallel) and
+  turned toward the loudness target, at most ±12 dB, on top of the clip's own Gain; clips
+  under 3 s, muted or near silent stay as they are. The two halves of a split shot are
+  measured together and get one level, so a split never jumps. Measurements are cached
+  in `levels.json` beside the project. The editor plays the levelled sound and shows
+  "Auto level +3.2 dB" under a clip's Gain (`POST /api/projects/{name}/levels`).
+- Tuning is about 2.6× faster: a window's candidates are rendered, measured and encoded
+  for listening side by side (up to 8 ffmpeg at once) instead of one after another
+  (a 28 s window: 39 s → 15 s; same picks). Stopping the job stops them all.
+- Projects have a revision (`rev`): a save from an older copy is refused (409) instead of
+  overwriting what changed since. The editor and Deliver then load the newer project
+  and apply their unsaved edits on top; an open editor reloads by itself when the project
+  changes elsewhere (another tab, or clips pointed away from a deleted or renamed cleaned
+  version: a new `project` event on `/api/events`). Saves with nothing changed are skipped.
+- The server refuses requests another website makes from your browser (by
+  `Sec-Fetch-Site`; links that open the app still work) and marks every response
+  `Cross-Origin-Resource-Policy: same-origin`, so other pages cannot embed your videos or
+  listen to the job events. Only video files can be added as sources (by extension, or a
+  picture ffprobe finds: `.mpg`, `.vob`, `.dv`…).
+
+**Fixed** (from the code review in carbon_review.md)
+
+- Export: a crossfade longer than half a short clip is shortened in `clips()` too, as it
+  already was for the picture, so the sound, subtitles and total length no longer drift
+  from the picture after such a clip (shared case in `tests/data/subtitle_mapping.json`).
+- Subtitles: undoing a merge puts the second line back with its translations (it was lost).
+- Subtitles tab: ⏎ goes to the next line that has a box in that column (lines already in
+  that language have none); typing not yet saved is saved when the tab closes or the
+  page is left; ⌘⇧⏎ adds a line after.
+- Enhance: Re-run on a version made with the music removed opens New run with
+  "Remove background music" ticked (it came up unticked).
+- `clean-audio-export --subtitles_srt` / `--subtitle_tracks` change only what they name;
+  the project's other subtitle settings stay. Export reports a missing music file by name.
+- Adding a song with the same file name as one already in the project keeps both
+  (`song_2.mp3`) instead of reusing the first.
+- Storage shows a Subtitles column, so the columns add up to "Added in all".
+- The jobs list shows subtitle jobs as `clean-audio-subtitles …`.
+- Memory use reads "unknown" instead of 0 when `ps` cannot list processes.
 
 ## 0.5.0
 

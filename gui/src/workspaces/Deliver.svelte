@@ -2,11 +2,12 @@
   // Deliver workspace: where exports start (docs/stitch-and-size-budget-plan.md §11). The
   // projects, the chosen project's export settings (keep the quality, or fit a size, with an
   // estimate), and the render queue (exports and estimates).
+  import { onDestroy } from "svelte";
   import type { Job } from "../lib/api";
   import { ltr } from "../lib/bidi";
   import { href, route } from "../lib/router.svelte";
-  import { reportError, store } from "../lib/state.svelte";
-  import { api } from "../lib/api";
+  import { onProjectChange, reportError, store } from "../lib/state.svelte";
+  import { api, ApiError } from "../lib/api";
   import type { Project } from "../lib/edit";
   import { formatDuration } from "../lib/time";
   import ExportSettings from "../deliver/ExportSettings.svelte";
@@ -28,24 +29,47 @@
     api.getProject(n).then((p) => { if (n === name) project = p; })
       .catch((e) => (loadError = e instanceof Error ? e.message : String(e)));
   });
+  // Saved on the revision loaded (as in the editor): when the project changed elsewhere
+  // the server refuses (409); then the newer one is loaded and these settings re-applied.
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsaved: ((p: Project) => void)[] = [];
   function commit(mutate: (p: Project) => void) {
     if (!project) return;
     const next = JSON.parse(JSON.stringify($state.snapshot(project))) as Project;
     mutate(next);
     project = next;
+    unsaved.push(mutate);
     clearTimeout(saveTimer);
     saveTimer = setTimeout(flush, 400);
   }
-  async function flush() {
+  async function flush(retry = true) {
     clearTimeout(saveTimer);
+    saveTimer = undefined;
+    if (!unsaved.length) return; // nothing changed here: nothing to save
     if (!project || !name) return;
+    const n = name;
+    const sent = unsaved;
+    unsaved = [];
     try {
-      await api.saveProject(name, $state.snapshot(project));
+      const r = await api.saveProject(n, $state.snapshot(project));
+      if (project && n === name) project.rev = r.rev;
     } catch (e) {
-      reportError(e);
+      if (e instanceof ApiError && e.status === 409 && retry && n === name) {
+        const latest = (await api.getProject(n)) as Project;
+        for (const m of [...sent, ...unsaved]) m(latest);
+        project = latest;
+        unsaved = [...sent, ...unsaved];
+        await flush(false);
+      } else {
+        reportError(e);
+      }
     }
   }
+  onDestroy(onProjectChange((e) => {
+    if (!project || e.name !== name || e.rev <= (project.rev ?? 0) || saveTimer || unsaved.length) return;
+    const n = name;
+    api.getProject(n).then((p) => { if (n === name && !saveTimer && !unsaved.length) project = p; }).catch(() => {});
+  }));
 </script>
 
 <Split key="deliver.queue" initial={420} min={300} max={640} fixed="second">

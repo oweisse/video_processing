@@ -285,6 +285,23 @@ def clear_tr(cues, cue_id, lang):
     return cues
 
 
+def set_flags(cues, cue_id, flags=None, tr=None):
+    """Set a cue's flags, and its translations' flags and source text: "looked at" clears
+    them all (and accepts an out-of-date translation as it is); undo puts them back."""
+    c = cues[_index(cues, cue_id)]
+    if flags is not None:
+        c["flags"] = [str(f) for f in flags]
+    for lang, v in (tr or {}).items():
+        t = (c.get("tr") or {}).get(lang)
+        if lang not in ("en", "he") or not t or not isinstance(v, dict):
+            continue
+        if "flags" in v:
+            t["flags"] = [str(f) for f in v["flags"] or []]
+        if "src" in v:
+            t["src"] = str(v["src"])
+    return cues
+
+
 def replace_range(cues, start, end, new_cues):
     """Cues whose middle is in [start, end) give way to new_cues; neighbours are trimmed."""
     keep = [c for c in cues if not (start <= (c["start"] + c["end"]) / 2 < end)]
@@ -335,11 +352,28 @@ def remove_coverage(coverage, start, end):
     return [[_round(a), _round(b)] for a, b in out if b - a > 0.05]
 
 
+MIN_TRIMMED = 0.3   # a line trimmed shorter than this goes altogether
+
+
 def delete_range(doc, start, end):
-    """Remove the cues whose middle is in [start, end) and mark that stretch as not
+    """Remove the cues whose middle is in [start, end), trim the ones that only reach into
+    it (their other part stays, for the clip next to it), and mark the stretch as not
     transcribed. Returns how many cues went."""
     before = len(doc["cues"])
-    doc["cues"] = [c for c in doc["cues"] if not (start <= (c["start"] + c["end"]) / 2 < end)]
+    keep = []
+    for c in doc["cues"]:
+        if start <= (c["start"] + c["end"]) / 2 < end:
+            continue
+        if c["start"] < end and c["end"] > start:     # reaches in from one side
+            if c["start"] < start:
+                c["end"] = _round(start)
+            else:
+                c["start"] = _round(end)
+            if c["end"] - c["start"] < MIN_TRIMMED:
+                continue
+            flag_reading(c)
+        keep.append(c)
+    doc["cues"] = keep
     doc["coverage"] = remove_coverage(doc.get("coverage") or [], start, end)
     return before - len(doc["cues"])
 
@@ -364,6 +398,8 @@ def apply_op(doc, op):
         cues = add(cues, op["start"], op["end"], op.get("text", ""))
     elif kind == "clear_tr":
         cues = clear_tr(cues, op["id"], op["lang"])
+    elif kind == "flags":
+        cues = set_flags(cues, op["id"], op.get("flags"), op.get("tr"))
     elif kind == "delete_range":
         delete_range(doc, float(op["start"]), float(op["end"]))
         cues = doc["cues"]

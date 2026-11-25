@@ -5,7 +5,7 @@
 import { api, type SubtitleOp, type SubtitlesSetup } from "../lib/api";
 import { loadPref, savePref } from "../lib/prefs";
 import { reportError, toast } from "../lib/state.svelte";
-import type { Cue, SubtitleDoc, Track } from "../lib/subtitles";
+import { isStale, normalise, type Cue, type SubtitleDoc, type Track } from "../lib/subtitles";
 
 export const subs = $state<{
   docs: Record<string, SubtitleDoc>;
@@ -69,6 +69,15 @@ function restoreOps(before: Cue, now: Cue | undefined): SubtitleOp[] {
     if (a !== b) ops.push(a ? { op: "text", id: now.id, lang, text: a } : { op: "clear_tr", id: now.id, lang });
   }
   if (now.start !== before.start || now.end !== before.end) ops.push({ op: "time", id: now.id, start: before.start, end: before.end });
+  // flags last: the edits above recompute some of them
+  const same = (x?: string[], y?: string[]) => (x ?? []).join() === (y ?? []).join();
+  const tr: Partial<Record<"en" | "he", { flags?: string[]; src?: string }>> = {};
+  for (const lang of ["en", "he"] as const) {
+    const a = before.tr?.[lang], b = now.tr?.[lang];
+    if (a && b && a.text === b.text && (!same(a.flags, b.flags) || a.src !== b.src)) tr[lang] = { flags: a.flags ?? [], src: a.src };
+  }
+  if (!same(before.flags, now.flags) || Object.keys(tr).length)
+    ops.push({ op: "flags", id: now.id, flags: before.flags ?? [], tr });
   return ops;
 }
 
@@ -77,9 +86,15 @@ export async function edit(sourceId: string, ops: SubtitleOp[], label = "edit", 
   const doc = subs.docs[sourceId];
   if (!doc || !ops.length) return false;
   const touched = new Set(ops.map((o) => ("id" in o ? o.id : "")).filter(Boolean));
-  // a stretch deleted at once: every cue in it counts as touched
+  // a stretch deleted at once: every cue in it, or trimmed at its edges, counts as touched
   for (const o of ops) if (o.op === "delete_range")
-    for (const c of doc.cues) if ((c.start + c.end) / 2 >= o.start && (c.start + c.end) / 2 < o.end) touched.add(c.id);
+    for (const c of doc.cues) if (c.start < o.end && c.end > o.start) touched.add(c.id);
+  // a merge also swallows the next cue: keep it, so undo can put it back
+  const sorted = [...doc.cues].sort((a, b) => a.start - b.start);
+  for (const o of ops) if (o.op === "merge") {
+    const i = sorted.findIndex((c) => c.id === o.id);
+    if (i >= 0 && i + 1 < sorted.length) touched.add(sorted[i + 1].id);
+  }
   const before = doc.cues.filter((c) => touched.has(c.id)).map(snapshot);
   const covered = ops.filter((o) => o.op === "delete_range")
     .map((o) => ({ op: "cover", start: (o as { start: number }).start, end: (o as { end: number }).end }) as SubtitleOp);
@@ -125,6 +140,19 @@ export async function edit(sourceId: string, ops: SubtitleOp[], label = "edit", 
     await loadDoc(sourceId, true);
     return false;
   }
+}
+
+/** Whether a line has anything to look at: its own flags, a translation's, or an
+ * out-of-date translation. */
+export function needsLook(c: Cue): boolean {
+  return !!c.flags?.length || (["en", "he"] as const).some((l) => isStale(c, l) || !!c.tr?.[l]?.flags?.length);
+}
+
+/** "Looked at": clear a line's flags and accept its translations as they are. */
+export function lookedOps(c: Cue): SubtitleOp[] {
+  const tr: Partial<Record<"en" | "he", { flags: string[]; src: string }>> = {};
+  for (const l of ["en", "he"] as const) if (c.tr?.[l]?.text) tr[l] = { flags: [], src: normalise(c.text) };
+  return [{ op: "flags", id: c.id, flags: [], tr }];
 }
 
 export async function undo() {

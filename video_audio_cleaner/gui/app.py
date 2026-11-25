@@ -117,10 +117,20 @@ def create_app(output_dir=None, dialogs=None):
         if host not in ALLOWED_HOSTS and host != "testserver":
             return PlainTextResponse("Forbidden host", status_code=403)
         path = request.url.path
+        # Requests made by another website (or another app on this Mac) in the browser:
+        # refused, so a page elsewhere cannot embed your videos (<video src=…/media/…>) or
+        # listen to /api/events. Opening a link to the app (a navigation) still works;
+        # tools without a browser send no Sec-Fetch-Site and are unaffected.
+        if (request.headers.get("sec-fetch-site") in ("cross-site", "same-site")
+                and request.headers.get("sec-fetch-mode") != "navigate"):
+            return PlainTextResponse("Requests from other sites are refused", status_code=403)
         if (path.startswith("/api/") and path != "/api/events"
                 and request.headers.get(API_HEADER) != "1"):
             return PlainTextResponse("Missing API header", status_code=403)
-        return await call_next(request)
+        response = await call_next(request)
+        # Older browsers without Sec-Fetch-*: they still will not hand our files to another site.
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        return response
 
     # -------------------------------------------------------------- library
     @app.get("/api/library")
@@ -246,6 +256,7 @@ def create_app(output_dir=None, dialogs=None):
                 moved.append(str(dst))
         from . import rename
         projects_changed = rename.retarget_clips(lib().output_dir, out["path"], None)
+        _announce_projects(projects_changed)
         lib().rescan()
         return {"moved": moved, "projects": projects_changed}
 
@@ -328,12 +339,38 @@ def create_app(output_dir=None, dialogs=None):
         return {"rev": doc["rev"], "cues": changed, "removed": [i for i in before if i not in after],
                 "coverage": doc.get("coverage") or []}
 
+    def _translate_context(c):
+        """The edit's lines around a stretch (from the editor), kept short and plain."""
+        if not isinstance(c, dict):
+            return None
+        before = [{"source": str(b.get("source") or "")[:600], "translation": (str(b["translation"])[:600] if b.get("translation") else None)}
+                  for b in (c.get("before") or [])[-2:] if isinstance(b, dict) and b.get("source")]
+        after = str(c.get("after") or "")[:600]
+        return {"before": before, "after": after} if before or after else None
+
     def _project_subtitles(name):
         from .. import subs
         project = projects.load(lib().output_dir, name)
         clips = (project.get("tracks") or {}).get("video") or []
         docs = {sid: subs.load(subs.doc_path(lib().output_dir, sid)) for sid in {c["source"] for c in clips}}
         return clips, docs
+
+    @app.post("/api/projects/{name}/levels")
+    async def project_levels(name: str, body: dict = Body(...)):
+        """Each clip's automatic level (export.level_clips): {clip id: {lufs, gain_db}}.
+        body: {"video": clips} as the editor has them now (the saved project's sources
+        are used); measured once and cached in levels.json beside the project."""
+        from .. import export
+        path = projects.path(lib().output_dir, name)
+        if not path.is_file():
+            raise HTTPException(404, "Unknown project")
+        proj = projects.load(lib().output_dir, name)
+        proj["tracks"] = {**proj.get("tracks", {}), "video": body.get("video") or []}
+        target = float(export.settings(proj)["target_lufs"])
+        try:
+            return await asyncio.to_thread(export.project_levels, proj, path, target)
+        except (export.ProjectError, KeyError) as e:
+            raise HTTPException(422, str(e))
 
     @app.get("/api/projects/{name}/subtitles")
     def project_subtitles(name: str, lang: str = "mixed"):
@@ -394,6 +431,7 @@ def create_app(output_dir=None, dialogs=None):
             raise HTTPException(409, str(exc))
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+        _announce_projects(updated)
         lib().rescan()
         return {"file": target.name, "path": str(target), "projects": updated}
 
@@ -633,7 +671,8 @@ def create_app(output_dir=None, dialogs=None):
                 dur = body.get("duration_sec")
                 end = float(start) + float(dur) if start is not None and dur else None
                 argv = commands.translate_argv(out_dir, source["id"], to, start, end,
-                                               body.get("mode") or "missing", bool(body.get("replace_edited")))
+                                               body.get("mode") or "missing", bool(body.get("replace_edited")),
+                                               _translate_context(body.get("context")))
                 title = f"Translate {source['name']} to {'English' if to == 'en' else 'Hebrew'}" + \
                         (f" {_fmt_window(float(start), float(dur))}" if end is not None else "")
                 meta = {"source_id": source["id"], "to": to, "start_sec": start, "duration_sec": dur,
@@ -704,7 +743,8 @@ def create_app(output_dir=None, dialogs=None):
                     except asyncio.TimeoutError:
                         yield "event: ping\ndata: {}\n\n"
                         continue
-                    yield f"event: job\ndata: {json.dumps(job, ensure_ascii=False)}\n\n"
+                    kind = job.pop("__event", "job") if isinstance(job, dict) else "job"
+                    yield f"event: {kind}\ndata: {json.dumps(job, ensure_ascii=False)}\n\n"
             finally:
                 queue.unsubscribe(q)
         return StreamingResponse(gen(), media_type="text/event-stream",
@@ -735,10 +775,26 @@ def create_app(output_dir=None, dialogs=None):
     def get_project(name: str):
         return _project_errors(projects.load, lib().output_dir, name)
 
+    def _announce_projects(names):
+        """Tell open editors these projects changed on disk (they reload or re-apply)."""
+        for n in names:
+            try:
+                rev = projects.load(lib().output_dir, n).get("rev") or 0
+            except (OSError, ValueError):
+                continue
+            queue.announce("project", {"name": n, "rev": rev})
+
     @app.put("/api/projects/{name}")
     def save_project(name: str, body: dict = Body(...)):
-        saved = _project_errors(projects.save, lib().output_dir, name, body)
-        return {"modified": saved["modified"]}
+        # "rev": the revision the editor loaded; an older one than on disk is refused (409,
+        # with the project as it is now) instead of overwriting what changed since.
+        expect = body.pop("rev", None)
+        try:
+            saved = _project_errors(projects.save, lib().output_dir, name, body, expect)
+        except projects.Conflict as c:
+            return JSONResponse({"detail": str(c), "project": c.current}, status_code=409)
+        queue.announce("project", {"name": name, "rev": saved["rev"]})
+        return {"modified": saved["modified"], "rev": saved["rev"]}
 
     @app.delete("/api/projects/{name}")
     def delete_project(name: str):

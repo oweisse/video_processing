@@ -58,8 +58,9 @@ def test_estimate_then_export(client, project, fx):
 def test_plan_lists_missing_files(client, project, fx, tmp_path):
     p = budgeted(client, fx)
     gone = str(tmp_path / "gone.wav")
+    p = client.get("/api/projects/cut", headers=H).json()      # the saved copy (its rev)
     p["tracks"]["video"][0]["audio"] = {"file": gone, "start_sec": 0}
-    client.put("/api/projects/cut", headers=H, json=p)
+    assert client.put("/api/projects/cut", headers=H, json=p).status_code == 200
     plan = client.get("/api/projects/cut/plan", headers=H).json()
     assert plan["missing"] == [gone]
 
@@ -67,3 +68,50 @@ def test_plan_lists_missing_files(client, project, fx, tmp_path):
 def test_estimate_job_needs_a_known_project(client, project):
     r = client.post("/api/jobs", headers=H, json={"type": "export_estimate", "project": "nope"})
     assert r.status_code == 404
+
+
+def test_levels_endpoint_measures_the_clips_as_sent(client, project, fx):
+    p = budgeted(client, fx)
+    clips = [{"id": "a", "source": p["tracks"]["video"][0]["source"], "in_sec": 0, "out_sec": 6},
+             {"id": "b", "source": p["tracks"]["video"][0]["source"], "in_sec": 10, "out_sec": 11}]
+    r = client.post("/api/projects/cut/levels", headers=H, json={"video": clips})
+    assert r.status_code == 200, r.text
+    lv = r.json()
+    assert lv["a"]["lufs"] is not None and lv["a"]["gain_db"] == pytest.approx(-16 - lv["a"]["lufs"], abs=0.02)
+    assert lv["b"] == {"lufs": None, "gain_db": 0.0}          # 1 s: too short to measure
+    assert client.post("/api/projects/nope/levels", headers=H, json={"video": []}).status_code == 404
+
+
+def test_a_save_from_an_older_copy_is_refused(client, project, fx):
+    p = budgeted(client, fx)
+    loaded = client.get("/api/projects/cut", headers=H).json()
+    rev = loaded["rev"]
+    # another tab saves first
+    other = {**loaded, "rev": rev}
+    other["export"] = {**other["export"], "target_lufs": -20}
+    r = client.put("/api/projects/cut", headers=H, json=other)
+    assert r.status_code == 200 and r.json()["rev"] == rev + 1
+    # this copy still builds on rev: refused, with the project as it is now
+    mine = {**loaded, "rev": rev}
+    r = client.put("/api/projects/cut", headers=H, json=mine)
+    assert r.status_code == 409
+    assert r.json()["project"]["export"]["target_lufs"] == -20 and r.json()["project"]["rev"] == rev + 1
+    # built on the newest revision it goes through; saves without a rev are not checked
+    assert client.put("/api/projects/cut", headers=H, json={**mine, "rev": rev + 1}).status_code == 200
+    assert client.put("/api/projects/cut", headers=H, json={k: v for k, v in p.items() if k != "rev"}).status_code == 200
+
+
+def test_deleting_a_version_points_clips_away_and_announces_it(client, project, fx):
+    from video_audio_cleaner.gui import projects as P
+    out_dir = project
+    budgeted(client, fx)
+    proj = P.load(out_dir, "cut")
+    name = "fixture_00m02s-00m06s.mp4"
+    proj["tracks"]["video"][0]["audio"] = {"file": str(out_dir / name), "output": name, "start_sec": 2.0}
+    before = P.save(out_dir, "cut", proj)["rev"]
+    events = []
+    client.app.state.queue.announce = lambda kind, payload: events.append((kind, payload))
+    assert client.post(f"/api/outputs/{name}/delete", headers=H).status_code == 200
+    after = P.load(out_dir, "cut")
+    assert after["tracks"]["video"][0]["audio"] is None and after["rev"] == before + 1
+    assert ("project", {"name": "cut", "rev": before + 1}) in events

@@ -192,9 +192,26 @@ class JobQueue:
         return done
 
     def subscribe(self):
+        self._loop = asyncio.get_running_loop()
         q = asyncio.Queue(maxsize=1000)
         self._subscribers.add(q)
         return q
+
+    def announce(self, event, payload):
+        """Send a non-job event (e.g. "project": {name, rev}) to every listener; callable
+        from any thread (the sync endpoints run in a thread pool)."""
+        loop = getattr(self, "_loop", None)
+        item = {**payload, "__event": event}
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._publish_item, item)
+
+    def _publish_item(self, item):
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
 
     def unsubscribe(self, q):
         self._subscribers.discard(q)

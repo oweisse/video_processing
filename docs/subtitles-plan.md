@@ -538,9 +538,11 @@ the Resulting video while editing.
   small chips with tooltips ("The recognizer was unsure here", "Reads fast: 24
   characters per second").
 - **Per-row actions** (buttons at the row's end, and keys while the row has focus):
-  split at the text cursor (`⌘⏎`), merge with the next (`⌘J`), delete (`⌘⌫`), add a cue
-  after (`⌘⇧N`), nudge start/end by 0.1 s (`⌥←/→` start, `⌥⇧←/→` end), play just this
-  cue (`⌘P`; plays the Resulting video from the cue's start and pauses at its end).
+  split at the text cursor (`⌘⏎`), merge with the next (`⌘J`), add a cue after (`⌘⇧⏎`),
+  play just this cue (`⌘P`; plays the Resulting video from the cue's start and pauses at
+  its end). Delete and the 0.1 s nudges are buttons only. As built: `⌘⌫` and `⌥←/→`
+  already edit text inside the box (delete to the line start, move by word) and
+  `⌘⇧N` opens a private window in the browser, so they are not taken.
   `⏎` moves to the next row (a line break inside a cue is `⇧⏎`).
 - **Follow:** while playing, the row under the playhead is highlighted and scrolled into
   view unless the user is typing in another row.

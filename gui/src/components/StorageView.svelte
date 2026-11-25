@@ -44,12 +44,13 @@
   {:else}
     <p class="dim small">Per video: the original file, and what this editor added for it. <b>Editing copies</b> are the
       light preview video, thumbnails and cached frames (remade when needed). <b>Tuning audio</b> is each tuning run's
-      candidate sound (blue stripes). <b>Rendered versions</b> are the cleaned videos (green stripes).</p>
+      candidate sound (blue stripes). <b>Rendered versions</b> are the cleaned videos (green stripes). <b>Subtitles</b> are
+      the subtitle lines, their earlier versions and the recognizer's raw output.</p>
     <div class="scroll-x">
       <table>
         <thead>
           <tr><th>Video</th><th class="num">Original</th><th class="num">Editing copies</th><th class="num">Tuning audio</th>
-            <th class="num">Rendered versions</th><th class="num">Added in all</th></tr>
+            <th class="num">Rendered versions</th><th class="num">Subtitles</th><th class="num">Added in all</th></tr>
         </thead>
         <tbody>
           {#each rows as r (r.id)}
@@ -59,6 +60,7 @@
               <td class="num">{r.editing ? formatBytes(r.editing) : "—"}</td>
               <td class="num">{r.tuning ? formatBytes(r.tuning) : "—"}<span class="faint small">{r.tunings ? ` · ${r.tunings} run${r.tunings > 1 ? "s" : ""}` : ""}</span></td>
               <td class="num">{r.rendered ? formatBytes(r.rendered) : "—"}<span class="faint small">{r.versions ? ` · ${r.versions}` : ""}</span></td>
+              <td class="num">{r.subtitles ? formatBytes(r.subtitles) : "—"}</td>
               <td class="num strong">{r.extra ? formatBytes(r.extra) : "—"}</td>
             </tr>
           {/each}
@@ -70,6 +72,7 @@
             <td class="num">{formatBytes(data.totals.editing)}</td>
             <td class="num">{formatBytes(data.totals.tuning)}</td>
             <td class="num">{formatBytes(data.totals.rendered)}</td>
+            <td class="num">{formatBytes(data.totals.subtitles)}</td>
             <td class="num strong">{formatBytes(data.totals.extra)}</td>
           </tr>
         </tfoot>

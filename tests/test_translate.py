@@ -83,3 +83,27 @@ def test_check_reply_flags():
         translate.check_reply(sent, {"lines": []}, "en")
     with pytest.raises(ValueError):
         translate.check_reply(sent, {"lines": [{"id": "1", "text": "a"}, {"id": "1", "text": "b"}]}, "en")
+
+
+def test_one_clip_reads_the_edits_neighbours_as_context(tmp_path):
+    # a clip of 3.2–7 s: the video's own lines outside it give way to the clip before and
+    # after it on the timeline
+    _doc(tmp_path, LINES)
+    calls = []
+    ctx = {"before": [{"source": "Previous clip's words.", "translation": "מילים מהקטע הקודם."}],
+           "after": "Next clip's words."}
+    translate.translate(tmp_path, "src1", "en", start=3.2, end=7, chat=fake_chat("EN:", calls), context=ctx)
+    assert len(calls) == 1
+    assert calls[0]["context_before_do_not_translate"] == ctx["before"]
+    assert calls[0]["context_after_do_not_translate"] == "Next clip's words."
+    # without it, the video's own neighbours, as before
+    calls.clear()
+    translate.translate(tmp_path, "src1", "en", start=3.2, end=7, mode="all", chat=fake_chat("EN:", calls))
+    assert calls[0]["context_before_do_not_translate"][0]["source"] == "שלום לכולם."
+    assert calls[0]["context_after_do_not_translate"] == "מתחילים בשעה 6."
+
+
+def test_translate_argv_carries_context(tmp_path):
+    from video_audio_cleaner.gui import commands
+    argv = commands.translate_argv(tmp_path, "src1", "he", 1, 2, context={"before": [], "after": "שלום"})
+    assert json.loads(argv[argv.index("--context") + 1]) == {"before": [], "after": "שלום"}
